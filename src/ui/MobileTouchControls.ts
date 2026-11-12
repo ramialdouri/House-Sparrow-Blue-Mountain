@@ -25,20 +25,21 @@ export function detectInitialMobileDevice(): boolean {
 }
 
 /**
- * Refined 3-gesture touch & pointer input controller (Tap · Drag · Long Press)
+ * Refined 3-gesture touch & pointer input controller (Drag · Tap · Tap + Long Press)
  * with a floating flight-angle HUD ring:
- * 1. TAP (< 200ms, <= 15px movement) -> Crisp Hop / Jump (`onTapJump`).
- * 2. DRAG (> 16px movement before long-press threshold while grounded) -> Smooth Ground/Perch Move.
- * 3. LONG PRESS (>= 200ms hold, or hold-drag in flight) -> Launches into 30° upward flight;
- *    dragging up without releasing smoothly increases the flight angle from 30° up to 60° upwards,
- *    dragging down dives, dragging left/right banks & steers, and releasing initiates Glide.
+ * 1. DRAG (> 15px movement while grounded/perched) -> Smooth Ground/Perch Move.
+ * 2. TAP (<= 240ms, <= 15px movement) -> Crisp Hop (`onTapJump`), priming the hop-to-fly window.
+ * 3. TAP + LONG PRESS (Tap to hop, then press & hold >= 85ms or drag in hop/flight) ->
+ *    Zero-delay wing prime on touch-down, launching into 30° upward flight; dragging up without
+ *    releasing smoothly increases climb angle from 30° up to 60°, dragging down dives,
+ *    dragging left/right banks & steers, and releasing initiates a -10° paraglider glide.
  */
 export class MobileTouchControls {
   private static readonly MAX_RADIUS = 48;
   private static readonly DEADZONE_PX = 6;
   private static readonly TAP_MAX_MOVE_PX = 15;
-  private static readonly TAP_MAX_MS = 230;
-  private static readonly LONG_PRESS_MS = 200;
+  private static readonly TAP_MAX_MS = 245;
+  private static readonly HOP_FOLLOWUP_HOLD_MS = 85;
   private static readonly CHORD_WINDOW_MS = 85;
 
   private readonly joystickRoot: HTMLDivElement;
@@ -65,8 +66,9 @@ export class MobileTouchControls {
   private chordFired = false;
 
   private longPressTimer: number | null = null;
-  private upwardDragFlyTimer: number | null = null;
   private longPressActive = false;
+  private flyHoldPrimed = false;
+  private pressEligibleForFly = false;
 
   public readonly stick: MobileStickState = {
     active: false,
@@ -77,13 +79,16 @@ export class MobileTouchControls {
   };
 
   public onTapJump?: () => void;
+  public onFlyHoldPrime?: (primed: boolean) => void;
   public onLongPressStart?: () => void;
   public onLongPressEnd?: () => void;
   public onTwoFingerTap?: () => boolean;
   public onFirstInteract?: () => void;
   public onMobileModeChange?: (isMobile: boolean) => void;
-  /** Optional query so mid-air touches immediately engage flight control. */
+  /** True when the bird is already in flying/gliding mode. */
   public isBirdFlying?: () => boolean;
+  /** True when the bird just hopped via Tap and is ready to chain immediately into flight. */
+  public isBirdHopReadyToFly?: () => boolean;
 
   constructor(parent: HTMLElement) {
     this.mobileActive = detectInitialMobileDevice();
@@ -118,20 +123,36 @@ export class MobileTouchControls {
     return this.longPressActive;
   }
 
+  private setFlyHoldPrime(primed: boolean): void {
+    if (this.flyHoldPrimed === primed) return;
+    this.flyHoldPrimed = primed;
+    this.onFlyHoldPrime?.(primed);
+  }
+
   private startLongPressTimer(): void {
     this.clearLongPressTimer();
-    if (this.isBirdFlying?.()) {
-      // Already in the air: engage flight control almost immediately unless it's a quick tap
-      this.longPressTimer = window.setTimeout(() => {
-        this.triggerLongPress();
-      }, 95);
+    const alreadyFlying = this.isBirdFlying?.() ?? false;
+    const hopReady = this.isBirdHopReadyToFly?.() ?? false;
+
+    // Grounded/perched without a preceding Tap-Hop: standalone Long Press does NOT fly.
+    // The sparrow must hop first (Tap) before flying (Tap + Long Press).
+    if (!alreadyFlying && !hopReady) {
+      this.pressEligibleForFly = false;
+      this.setFlyHoldPrime(false);
       return;
     }
+
+    this.pressEligibleForFly = true;
+    // Zero-delay anticipation: immediately prime wings open on touch-down so hop->fly has 0ms lag
+    if (hopReady && !alreadyFlying) {
+      this.setFlyHoldPrime(true);
+    }
+
     this.longPressTimer = window.setTimeout(() => {
-      if (!this.groundDragStarted) {
+      if (this.primaryId !== null && this.pressEligibleForFly && !this.groundDragStarted) {
         this.triggerLongPress();
       }
-    }, MobileTouchControls.LONG_PRESS_MS);
+    }, MobileTouchControls.HOP_FOLLOWUP_HOLD_MS);
   }
 
   private clearLongPressTimer(): void {
@@ -139,14 +160,11 @@ export class MobileTouchControls {
       window.clearTimeout(this.longPressTimer);
       this.longPressTimer = null;
     }
-    if (this.upwardDragFlyTimer !== null) {
-      window.clearTimeout(this.upwardDragFlyTimer);
-      this.upwardDragFlyTimer = null;
-    }
   }
 
   private triggerLongPress(): void {
     this.clearLongPressTimer();
+    this.setFlyHoldPrime(false);
     if (!this.longPressActive && this.primaryId !== null) {
       this.longPressActive = true;
       this.groundDragStarted = false;
@@ -158,6 +176,7 @@ export class MobileTouchControls {
 
   private endLongPress(): void {
     this.clearLongPressTimer();
+    this.setFlyHoldPrime(false);
     if (this.longPressActive) {
       this.longPressActive = false;
       this.stick.longPress = false;
@@ -202,13 +221,15 @@ export class MobileTouchControls {
     if (rawDist > MobileTouchControls.TAP_MAX_MOVE_PX) {
       this.chordCandidate = false;
       if (!this.longPressActive) {
-        if (this.isBirdFlying?.()) {
-          // Mid-air drag immediately engages flight steering / climb / dive
+        if (this.pressEligibleForFly || this.isBirdFlying?.()) {
+          // Hop-ready or mid-air drag immediately engages flight steering / 30°->60° climb / dive
+          this.updateStickFromDelta(rawDx, rawDy);
           this.triggerLongPress();
         } else if (!this.groundDragStarted) {
-          // Grounded/perched drag started before LONG_PRESS_MS -> enter Ground Drag mode
+          // Grounded/perched drag without prior hop -> smooth Ground/Perch Move
           this.groundDragStarted = true;
           this.clearLongPressTimer();
+          this.setFlyHoldPrime(false);
         }
       }
     }
@@ -340,6 +361,8 @@ export class MobileTouchControls {
           this.secondaryId = null;
         } else if (t.identifier === this.primaryId) {
           this.clearLongPressTimer();
+          this.setFlyHoldPrime(false);
+          this.pressEligibleForFly = false;
           const wasLong = this.longPressActive;
           if (wasLong) {
             this.endLongPress();
@@ -380,7 +403,7 @@ export class MobileTouchControls {
     window.addEventListener('touchend', (e) => handleTouchEnd(e, false), { passive: false });
     window.addEventListener('touchcancel', (e) => handleTouchEnd(e, true), { passive: false });
 
-    // Desktop pointer support: Tap = Hop, Drag = Move, Long Press = Fly (30° -> 60° on drag up), Release = Glide
+    // Desktop pointer support: Drag = Move, Tap = Hop, Tap + Long Press = Fly (30° -> 60° on drag up), Release = -10° Glide
     window.addEventListener('mousedown', (e: MouseEvent) => {
       if (e.button !== 0 || document.pointerLockElement !== null || this.primaryId !== null) return;
       if (this.isInteractiveUiTarget(e.target)) return;
@@ -413,6 +436,8 @@ export class MobileTouchControls {
     window.addEventListener('mouseup', (e: MouseEvent) => {
       if (e.button !== 0 || this.primaryId !== -1) return;
       this.clearLongPressTimer();
+      this.setFlyHoldPrime(false);
+      this.pressEligibleForFly = false;
       const wasLong = this.longPressActive;
       if (wasLong) {
         this.endLongPress();
@@ -474,7 +499,7 @@ export class MobileTouchControls {
     }
     this.joystickRoot.classList.add('is-active');
 
-    if (this.stick.longPress) {
+    if (this.stick.longPress || this.flyHoldPrimed) {
       this.joystickRoot.classList.add('is-flying');
       if (this.stick.y < -0.22) {
         this.joystickRoot.classList.add('is-diving');
@@ -502,6 +527,8 @@ export class MobileTouchControls {
 
   public resetAllTouches(): void {
     this.clearLongPressTimer();
+    this.setFlyHoldPrime(false);
+    this.pressEligibleForFly = false;
     if (this.longPressActive) {
       this.endLongPress();
     }

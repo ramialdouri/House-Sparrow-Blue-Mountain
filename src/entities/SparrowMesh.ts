@@ -47,6 +47,14 @@ export interface SparrowPoseInput {
   introHeadRoll?: number;
   /** Vertical velocity in SU/s (negative when descending/stooping) */
   verticalVel?: number;
+  /** True when the player is actively commanding a downward dive/stoop */
+  isDiving?: boolean;
+  /** Total 3D airspeed in SU/s for dynamic aero-trim */
+  airspeed?: number;
+  /** True while airborne during a tap-hop (primes flight-ready leg tuck & shoulder poise) */
+  hopAirborne?: boolean;
+  /** 0..1: instant 0ms wing-unfurl anticipation on the 2nd press of Tap + Long Press */
+  flyHoldPrime?: number;
   /** 3-stage wall-knockout state: falling -> belly-flopped grounded -> feather-ruffle shaking */
   dizzyState?: DizzyPoseState;
   dizzyPhase?: number;
@@ -911,6 +919,8 @@ export class SparrowMesh {
   private readonly bodyMesh: THREE.Mesh;
   private mat: THREE.NodeMaterial;
   private crownEquipped = false;
+  private wingFlapPhase = 0;
+  private wasFlapping = false;
 
   constructor(species: BirdSpecies) {
     this.palette = resolveSpeciesPalette(species);
@@ -1132,6 +1142,40 @@ export class SparrowMesh {
     rig.footPivot.rotation.z -= rig.footPivot.rotation.z * a;
     rig.frontToesPivot.rotation.x += (frontToesX - rig.frontToesPivot.rotation.x) * a;
     rig.halluxPivot.rotation.x += (halluxX - rig.halluxPivot.rotation.x) * a;
+  }
+
+  private applyWingJointPose(
+    dt: number,
+    rate: number,
+    leftInX: number,
+    leftInY: number,
+    leftInZ: number,
+    rightInX: number,
+    rightInY: number,
+    rightInZ: number,
+    leftOutX: number,
+    leftOutY: number,
+    leftOutZ: number,
+    rightOutX: number,
+    rightOutY: number,
+    rightOutZ: number
+  ): void {
+    const a = Math.min(1, dt * rate);
+    this.wingLeftInner.rotation.x += (leftInX - this.wingLeftInner.rotation.x) * a;
+    this.wingLeftInner.rotation.y += (leftInY - this.wingLeftInner.rotation.y) * a;
+    this.wingLeftInner.rotation.z += (leftInZ - this.wingLeftInner.rotation.z) * a;
+
+    this.wingRightInner.rotation.x += (rightInX - this.wingRightInner.rotation.x) * a;
+    this.wingRightInner.rotation.y += (rightInY - this.wingRightInner.rotation.y) * a;
+    this.wingRightInner.rotation.z += (rightInZ - this.wingRightInner.rotation.z) * a;
+
+    this.wingLeftOuter.rotation.x += (leftOutX - this.wingLeftOuter.rotation.x) * a;
+    this.wingLeftOuter.rotation.y += (leftOutY - this.wingLeftOuter.rotation.y) * a;
+    this.wingLeftOuter.rotation.z += (leftOutZ - this.wingLeftOuter.rotation.z) * a;
+
+    this.wingRightOuter.rotation.x += (rightOutX - this.wingRightOuter.rotation.x) * a;
+    this.wingRightOuter.rotation.y += (rightOutY - this.wingRightOuter.rotation.y) * a;
+    this.wingRightOuter.rotation.z += (rightOutZ - this.wingRightOuter.rotation.z) * a;
   }
 
   /**
@@ -1459,11 +1503,19 @@ export class SparrowMesh {
     this.lowerBeakPivot.rotation.x = beakGap * 0.84;
 
     const vy = p.verticalVel ?? 0;
-    const descent =
-      p.mode === 'flying' && !p.isBraking
+    const airspeed = p.airspeed ?? 0;
+    const activeDive = p.isDiving ?? false;
+    // Stoop factor ONLY engages during intentional dives or steep high-speed plunges — never during -10° paraglider glides
+    const stoop =
+      p.mode === 'flying' && !p.isBraking && (activeDive || (vy < -8.5 && p.pitchAngle > 0.38))
         ? Math.max(
             0,
-            Math.min(1, Math.max((-vy - 0.35) / 10.5, Math.max(0, p.pitchAngle - 0.05) * 1.1))
+            Math.min(
+              1,
+              activeDive
+                ? Math.max(0.45, Math.min(1, (-vy - 1.5) / 14.0 + Math.max(0, p.pitchAngle) * 0.65))
+                : (-vy - 8.5) / 10.0
+            )
           )
         : 0;
 
@@ -1479,20 +1531,34 @@ export class SparrowMesh {
     const baseHeadZ = this.palette.isPigeon ? 0.224 : 0.184 * this.palette.bodyScale[2];
     const baseHeadY = this.palette.isPigeon ? 0.295 : 0.208 * this.palette.bodyScale[1];
     this.headPivot.position.x = 0;
-    this.headPivot.position.z = baseHeadZ + pigeonBobZ + peckStrike * 0.092 + eatDip * 0.105;
-    this.headPivot.position.y = baseHeadY - peckStrike * 0.032 - eatDip * 0.072;
+    const aeroNeckReach =
+      p.mode === 'flying' ? (stoop > 0.05 ? 0.032 * stoop : 0.014) : 0;
+    this.headPivot.position.z =
+      baseHeadZ + pigeonBobZ + aeroNeckReach + peckStrike * 0.092 + eatDip * 0.105;
+    this.headPivot.position.y =
+      baseHeadY - (p.mode === 'flying' ? 0.012 : 0) - peckStrike * 0.032 - eatDip * 0.072;
 
-    const descentHeadStabilize = -descent * 0.34;
+    // Avian horizon-stabilized gaze: counter-rotates against body climb/glide pitch so the bird looks ahead along its flight path
+    const flightHeadStabilize =
+      p.mode === 'flying'
+        ? Math.max(-0.42, Math.min(0.48, -this.bodyPivot.rotation.x * 0.56))
+        : 0;
     const targetHeadPitch =
-      p.headLookLocal.y - bonk * 0.18 + descentHeadStabilize + peckStrike * 0.32 + eatDip * 0.58;
+      p.headLookLocal.y -
+      bonk * 0.18 +
+      flightHeadStabilize +
+      peckStrike * 0.32 +
+      eatDip * 0.58;
+    const flightBankLookYaw = p.mode === 'flying' ? -p.bankAngle * 0.24 : 0;
 
     this.headPivot.rotation.y +=
-      (p.headLookLocal.x + bonkYawShake - this.headPivot.rotation.y) * Math.min(1, dt * 14);
+      (p.headLookLocal.x + flightBankLookYaw + bonkYawShake - this.headPivot.rotation.y) *
+      Math.min(1, dt * 16);
     this.headPivot.rotation.x +=
       (targetHeadPitch - this.headPivot.rotation.x) *
-      Math.min(1, dt * (peck > 0.01 || eat > 0.01 ? 30 : 14));
+      Math.min(1, dt * (peck > 0.01 || eat > 0.01 ? 30 : 18));
     this.headPivot.rotation.z =
-      idleTilt - p.bankAngle * 0.22 + bonkRollShake + (p.introHeadRoll ?? 0);
+      idleTilt - p.bankAngle * (p.mode === 'flying' ? 0.34 : 0.22) + bonkRollShake + (p.introHeadRoll ?? 0);
 
     // Keep bodyPivot scale strictly (1, 1, 1) so child leg/wing bones never stretch; puff torso mesh only
     this.bodyPivot.scale.set(1, 1, 1);
@@ -1504,119 +1570,222 @@ export class SparrowMesh {
     }
 
     if (p.mode === 'flying') {
-      this.bodyPivot.rotation.z += (-p.bankAngle * 0.68 - this.bodyPivot.rotation.z) * Math.min(1, dt * 10);
+      const targetBankRoll = -p.bankAngle * 0.76;
+      this.bodyPivot.rotation.z +=
+        (targetBankRoll - this.bodyPivot.rotation.z) * Math.min(1, dt * 13);
       const targetPitch =
         bonk > 0.1
           ? -0.38 * bonk
           : p.isBraking
-            ? -0.46
-            : p.pitchAngle + descent * 0.14 + peckStrike * 0.24;
-      this.bodyPivot.rotation.x += (targetPitch - this.bodyPivot.rotation.x) * Math.min(1, dt * 12);
-      this.bodyPivot.position.y = 0;
+            ? -0.50
+            : p.pitchAngle + stoop * 0.10 + peckStrike * 0.24;
+      this.bodyPivot.rotation.x += (targetPitch - this.bodyPivot.rotation.x) * Math.min(1, dt * 15);
       this.bodyPivot.position.z = peckStrike * 0.085;
 
       const tuck = bonk > 0.05 ? 0 : (p.wingTuck ?? 0);
-      const climbBoost = Math.max(0, Math.min(1, (-p.pitchAngle - 0.45) / 0.60));
-      const wingLerp = Math.min(1, dt * 18);
+      const climbBoost = Math.max(0, Math.min(1, (-p.pitchAngle - 0.35) / 0.68));
+      let bodyStrokeLiftY = 0;
 
-      if (tuck > 0.55 && !p.isBraking && descent < 0.18 && p.flapTimer <= 0) {
-        const boundRipple = Math.sin(p.elapsed * 22.0) * 0.035;
-        this.wingLeftInner.rotation.x += (-0.44 - this.wingLeftInner.rotation.x) * wingLerp;
-        this.wingLeftInner.rotation.y += (-1.38 + boundRipple - this.wingLeftInner.rotation.y) * wingLerp;
-        this.wingLeftInner.rotation.z += (0.15 - this.wingLeftInner.rotation.z) * wingLerp;
-
-        this.wingRightInner.rotation.x += (-0.44 - this.wingRightInner.rotation.x) * wingLerp;
-        this.wingRightInner.rotation.y += (1.38 - boundRipple - this.wingRightInner.rotation.y) * wingLerp;
-        this.wingRightInner.rotation.z += (-0.15 - this.wingRightInner.rotation.z) * wingLerp;
-
-        this.wingLeftOuter.rotation.set(0, -0.22, 0.04);
-        this.wingRightOuter.rotation.set(0, 0.22, -0.04);
+      if (tuck > 0.55 && !p.isBraking && stoop < 0.15 && p.flapTimer <= 0) {
+        this.wasFlapping = false;
+        const boundRipple = Math.sin(p.elapsed * 22.0) * 0.03;
+        this.applyWingJointPose(
+          dt,
+          20,
+          -0.44,
+          -1.38 + boundRipple,
+          0.15,
+          -0.44,
+          1.38 - boundRipple,
+          -0.15,
+          0,
+          -0.22,
+          0.04,
+          0,
+          0.22,
+          -0.04
+        );
       } else {
         let stroke = 0;
         let outerFlex = 0;
         let sweepBack = 0;
         let outerSweep = 0;
-        let wingPitch = 0.07;
+        let wingPitch = -0.08;
+        let outerTwist = 0;
+        let jointRate = 24;
 
         if (bonk > 0.05) {
+          this.wasFlapping = false;
           stroke = 0.45 + Math.sin(bonk * Math.PI * 8.0) * 0.52;
           outerFlex = 0.28;
-          wingPitch = 0.48;
+          wingPitch = -0.38;
+          jointRate = 34;
         } else if (p.flapTimer > 0) {
-          const flapFreq = 15.2 + climbBoost * 2.8;
-          const flutterHz = p.elapsed * Math.PI * 2.0 * flapFreq;
-          stroke = Math.sin(flutterHz) * (0.96 + climbBoost * 0.16);
-          outerFlex = Math.cos(flutterHz) * (0.46 + climbBoost * 0.10);
-          sweepBack = descent * 0.22;
-          wingPitch = 0.10 + climbBoost * 0.16;
+          // Stateful phase accumulator prevents phase-warping when climb angle changes 30° -> 60°
+          if (!this.wasFlapping) {
+            this.wasFlapping = true;
+            this.wingFlapPhase = 0.24; // Start right at top of power downstroke for 0ms visual snap
+          }
+          const flapFreq = this.palette.isPigeon ? 9.4 : 13.6 + climbBoost * 3.2;
+          this.wingFlapPhase = (this.wingFlapPhase + dt * flapFreq * Math.PI * 2.0) % (Math.PI * 2.0);
+          const sinP = Math.sin(this.wingFlapPhase);
+          const cosP = Math.cos(this.wingFlapPhase);
+
+          // Asymmetric figure-8 avian wingbeat:
+          // sinP < 0 is power downstroke (stroke goes positive->negative), wait:
+          // Note: stroke > 0 raises wings UP (+Y), stroke < 0 drives wings DOWN (-Y).
+          // When phase goes 0.24 -> pi, cosP goes +0.97 -> -1 (wings sweep from HIGH +1.02 DOWN to -0.82 = power downstroke!)
+          // Let's use cosP for vertical elevation so phase=0 starts at peak elevation and immediately drives DOWN!
+          const isDownstroke = sinP >= 0; // d(cosP)/dt = -sinP <= 0 -> moving DOWN!
+          const strokeUpAmp = 1.02 + climbBoost * 0.16;
+          const strokeDownAmp = 0.78 + climbBoost * 0.14;
+          stroke = cosP >= 0 ? cosP * strokeUpAmp : cosP * strokeDownAmp;
+
+          if (isDownstroke) {
+            // Power downstroke: full span extension, forward reach, pronated thrust pitch (+X)
+            const power = sinP;
+            outerFlex = 0.14 + power * (0.28 + climbBoost * 0.12);
+            sweepBack = -0.18 * power - climbBoost * 0.08;
+            outerSweep = -0.08 * power;
+            wingPitch = 0.14 + power * 0.12 - climbBoost * 0.06;
+            outerTwist = 0.10 * power;
+            bodyStrokeLiftY = 0.020 * power;
+          } else {
+            // Feathered recovery upstroke: carpal wrist flexes inward, primaries supinate (-X) & sweep slightly back
+            const up = -sinP;
+            outerFlex = -0.54 * up;
+            sweepBack = 0.18 * up;
+            outerSweep = 0.30 * up;
+            wingPitch = -0.24 * up - climbBoost * 0.10;
+            outerTwist = -0.18 * up;
+            bodyStrokeLiftY = -0.008 * up;
+          }
+          jointRate = 42;
         } else if (p.isBraking) {
-          stroke = 0.32 + Math.sin(p.elapsed * 32) * 0.48;
-          outerFlex = 0.26;
-          wingPitch = 0.48;
-        } else if (descent > 0.04) {
-          const windHz = 24.0 + descent * 14.0;
-          const windFlutter =
-            Math.sin(p.elapsed * windHz) * (0.068 + descent * 0.125) +
-            Math.sin(p.elapsed * 41.0) * (0.032 * descent);
-          stroke = 0.18 + descent * 0.36 + windFlutter;
-          outerFlex =
-            -0.06 +
-            descent * 0.24 +
-            Math.cos(p.elapsed * windHz) * (0.085 + descent * 0.14);
-          sweepBack = descent * 0.74;
-          outerSweep = descent * 0.44;
-          wingPitch = 0.06 - descent * 0.22;
+          this.wasFlapping = false;
+          const brakeWave = Math.sin(p.elapsed * 28.0);
+          stroke = 0.28 + brakeWave * 0.46;
+          outerFlex = 0.24 + Math.cos(p.elapsed * 28.0) * 0.14;
+          sweepBack = -0.22;
+          outerSweep = -0.10;
+          wingPitch = -0.46; // Cup underside of wings forward against airflow
+          jointRate = 32;
+        } else if (stoop > 0.04) {
+          // Intentional high-speed falcon stoop / dive: sleek swept-back delta teardrop
+          this.wasFlapping = false;
+          const speedRatio = Math.min(1, airspeed / 24.0);
+          const aeroTremor =
+            Math.sin(p.elapsed * 31.0) * 0.022 * stoop * speedRatio +
+            Math.cos(p.elapsed * 47.0) * 0.012 * stoop * speedRatio;
+          stroke = 0.08 + stoop * 0.16 + aeroTremor;
+          outerFlex = -0.16 * stoop + aeroTremor * 0.8;
+          sweepBack = 0.32 + stoop * 0.58;
+          outerSweep = 0.18 + stoop * 0.34;
+          wingPitch = 0.06 * stoop;
+          jointRate = 22;
         } else {
-          const soarWave = Math.sin(p.elapsed * 12.5) * 0.055;
-          stroke = 0.14 + soarWave;
-          outerFlex = -0.09 + Math.cos(p.elapsed * 12.5) * 0.05;
+          // Buoyant -10° Paraglider Soaring Glide:
+          // Wide, high-aspect cambered canopy with gentle dihedral & upturned slotted primary tips
+          this.wasFlapping = false;
+          const speedLift = Math.max(0, Math.min(1, (airspeed - 7.5) / 9.0));
+          const breathA = p.elapsed * 2.6;
+          const soarWave = Math.sin(breathA) * 0.024 + Math.sin(p.elapsed * 6.4) * 0.008 * speedLift;
+          stroke = 0.16 + speedLift * 0.04 + soarWave;
+          outerFlex = 0.15 + speedLift * 0.05 + Math.sin(breathA - 0.7) * 0.022;
+          sweepBack = -0.05 + speedLift * 0.04;
+          outerSweep = 0.04;
+          wingPitch = -0.09; // Subtle positive camber catching rising air
+          outerTwist = -0.04;
+          bodyStrokeLiftY = Math.sin(breathA) * 0.008;
+          jointRate = 20;
         }
 
-        const aileronTrim = p.bankAngle * 0.10;
-        this.wingLeftInner.rotation.set(wingPitch, 0.05 - sweepBack, -stroke - aileronTrim);
-        this.wingRightInner.rotation.set(wingPitch, -0.05 + sweepBack, stroke - aileronTrim);
-        this.wingLeftOuter.rotation.set(0, -outerSweep, -outerFlex);
-        this.wingRightOuter.rotation.set(0, outerSweep, outerFlex);
+        // Coordinated aerodynamic banking differential (aileron roll + subtle inner/outer sweep trim)
+        const aileronTrim = p.bankAngle * 0.15;
+        const bankSweepDiff = p.bankAngle * 0.08;
+        const bankFlexDiff = p.bankAngle * 0.06;
+
+        this.applyWingJointPose(
+          dt,
+          jointRate,
+          wingPitch,
+          0.05 - sweepBack - bankSweepDiff,
+          -stroke - aileronTrim,
+          wingPitch,
+          -0.05 + sweepBack - bankSweepDiff,
+          stroke - aileronTrim,
+          outerTwist,
+          -outerSweep,
+          -outerFlex - bankFlexDiff,
+          outerTwist,
+          outerSweep,
+          outerFlex - bankFlexDiff
+        );
       }
 
+      this.bodyPivot.position.y += (bodyStrokeLiftY - this.bodyPivot.position.y) * Math.min(1, dt * 22);
+
+      // Tail ruddervator: fans wide for climb & braking, sleek spear in dive, broad buoyant fan in -10° paraglider glide
       const fanSpread =
         bonk > 0.05
           ? 0.17
           : p.isBraking
-            ? 0.14
-            : descent > 0.08
-              ? 0.072 + descent * 0.065 + Math.abs(p.bankAngle) * 0.04
+            ? 0.155
+            : stoop > 0.08
+              ? 0.068 * (1.0 - stoop * 0.58) + Math.abs(p.bankAngle) * 0.025
               : tuck > 0.55
                 ? 0.028
-                : 0.070 + climbBoost * 0.045 + Math.abs(p.bankAngle) * 0.04;
-      const tailWindTrim = descent > 0.05 ? Math.sin(p.elapsed * 29.0) * 0.05 * descent : 0;
-      this.tailPivot.rotation.x =
+                : 0.084 + climbBoost * 0.042 + Math.abs(p.bankAngle) * 0.045;
+      const tailFlutter =
+        p.flapTimer > 0
+          ? Math.sin(this.wingFlapPhase) * 0.045
+          : stoop > 0.1
+            ? Math.sin(p.elapsed * 30.0) * 0.022 * stoop
+            : Math.sin(p.elapsed * 2.6 - 0.5) * 0.015;
+      const targetTailX =
         p.isBraking || bonk > 0.1
-          ? -0.44
-          : -0.05 - p.pitchAngle * 0.22 - descent * 0.20 + tailWindTrim;
-      this.tailPivot.rotation.z = -p.bankAngle * 0.28;
+          ? -0.46
+          : stoop > 0.08
+            ? -0.02 - stoop * 0.08 + tailFlutter
+            : -0.06 - p.pitchAngle * 0.18 + tailFlutter;
+      this.tailPivot.rotation.x += (targetTailX - this.tailPivot.rotation.x) * Math.min(1, dt * 18);
+      this.tailPivot.rotation.y +=
+        (-p.bankAngle * 0.16 - this.tailPivot.rotation.y) * Math.min(1, dt * 14);
+      this.tailPivot.rotation.z +=
+        (-p.bankAngle * 0.34 - this.tailPivot.rotation.z) * Math.min(1, dt * 16);
       for (let idx = 0; idx < this.tailFeathers.length; idx++) {
         this.tailFeathers[idx].rotation.y = (idx - 3.0) * fanSpread;
       }
 
       if (p.isBraking || bonk > 0.15) {
-        this.applyLegJointPose(this.leftLegRig, dt, 16, -0.42, 0.22, 0.10, -0.34, 0.22, -0.08);
-        this.applyLegJointPose(this.rightLegRig, dt, 16, -0.42, 0.22, 0.10, -0.34, 0.22, 0.08);
+        this.applyLegJointPose(this.leftLegRig, dt, 18, -0.42, 0.22, 0.10, -0.34, 0.22, -0.08);
+        this.applyLegJointPose(this.rightLegRig, dt, 18, -0.42, 0.22, 0.10, -0.34, 0.22, 0.08);
       } else {
-        this.applyLegJointPose(this.leftLegRig, dt, 15, -0.58, -1.08, 1.15, 0.92, -0.82, 0.04);
-        this.applyLegJointPose(this.rightLegRig, dt, 15, -0.58, -1.08, 1.15, 0.92, -0.82, -0.04);
+        // Streamlined tucked feet nestled cleanly into belly plumage during flight & glide
+        this.applyLegJointPose(this.leftLegRig, dt, 18, -0.60, -1.10, 1.16, 0.94, -0.84, 0.04);
+        this.applyLegJointPose(this.rightLegRig, dt, 18, -0.60, -1.10, 1.16, 0.94, -0.84, -0.04);
       }
       return;
     }
 
-    // --- Grounded Hop / Pigeon Walk / Perched Grip + Exact 2-Bone Planted Leg IK ---
+    // --- Grounded Hop / Pigeon Walk / Perched Grip + Flight-Primed Hop Anticipation ---
     const bs = this.palette.bodyScale;
     const breathe = Math.sin(p.elapsed * 3.4) * 0.015 + Math.sin(p.elapsed * 1.7) * 0.004;
     const settleOffset = p.perchSettleOffset ?? 0;
     const arrival = Math.max(0, Math.min(1, p.perchArrival ?? 0));
+    const hopAirborne = p.hopAirborne ?? false;
+    const flyPrime = Math.max(0, Math.min(1, p.flyHoldPrime ?? 0));
     const bonkHop = bonk > 0 ? Math.sin(bonk * Math.PI) * 0.032 : 0;
     const peckPitch = peckStrike * 0.38 + eatDip * 0.52;
     this.bodyPivot.position.z = peckStrike * 0.095 + eatDip * 0.085;
+
+    if (flyPrime > 0.01) {
+      // Prime phase accumulator at top of downstroke so transitioning to flying mode has 0ms seam
+      this.wasFlapping = true;
+      this.wingFlapPhase = 0.20;
+    } else {
+      this.wasFlapping = false;
+    }
 
     if (this.palette.isPigeon && p.hopPhase > 0.005) {
       const bob = Math.abs(Math.sin(p.hopPhase * Math.PI * 2.0)) * 0.032;
@@ -1646,41 +1815,63 @@ export class SparrowMesh {
         rightK.frontToesX,
         rightK.halluxX
       );
-    } else if (p.hopPhase > 0.005) {
-      const hopK = this.computeHopKinematics(p.hopPhase, _hopK);
-      this.bodyPivot.position.y = hopK.bodyY + breathe + bonkHop - peckStrike * 0.025 - eatDip * 0.042;
+    } else if (p.hopPhase > 0.005 || hopAirborne) {
+      const hopK = this.computeHopKinematics(Math.max(0.18, p.hopPhase), _hopK);
+      this.bodyPivot.position.y =
+        hopK.bodyY * (hopAirborne ? 0.55 : 1.0) + breathe + bonkHop - peckStrike * 0.025 - eatDip * 0.042;
       this.bodyPivot.rotation.z *= 0.82;
-      const pitchShift =
-        p.hopPhase < 0.2
-          ? 0.08
-          : p.hopPhase < 0.65
-            ? -0.18
-            : 0.05;
+      // Athletic flight-ready hop posture: pitches upward during ascent/apex & tilts straight to -30° if flyPrime engages
+      const baseHopPitch =
+        flyPrime > 0.01
+          ? -0.52
+          : hopAirborne
+            ? vy > -0.8
+              ? -0.26
+              : -0.10
+            : p.hopPhase < 0.2
+              ? 0.06
+              : p.hopPhase < 0.68
+                ? -0.20
+                : 0.04;
       this.bodyPivot.rotation.x +=
-        (-0.08 + pitchShift - bonk * 0.18 + peckPitch - this.bodyPivot.rotation.x) *
-        Math.min(1, dt * (eat > 0.01 ? 26 : 18));
+        (baseHopPitch - bonk * 0.18 + peckPitch - this.bodyPivot.rotation.x) *
+        Math.min(1, dt * (flyPrime > 0.01 ? 36 : eat > 0.01 ? 26 : 24));
+
+      // During an airborne tap-hop, tuck legs athletically toward flight posture so takeoff transition is instant
+      const airTuckW =
+        flyPrime > 0.01
+          ? 1.0
+          : hopAirborne
+            ? Math.max(0, Math.min(0.85, Math.sin(Math.min(1, p.hopPhase) * Math.PI) * 0.95))
+            : 0.0;
+      const legHipX = hopK.hipX * (1 - airTuckW) + -0.56 * airTuckW;
+      const legHockX = hopK.hockX * (1 - airTuckW) + -1.02 * airTuckW;
+      const legFootX = hopK.footX * (1 - airTuckW) + 1.10 * airTuckW;
+      const legFrontX = hopK.frontToesX * (1 - airTuckW) + 0.88 * airTuckW;
+      const legHalluxX = hopK.halluxX * (1 - airTuckW) + -0.78 * airTuckW;
+      const legRate = flyPrime > 0.01 ? 38 : 30;
 
       this.applyLegJointPose(
         this.leftLegRig,
         dt,
-        28,
-        hopK.hipX,
-        hopK.hockX,
-        hopK.footX,
-        hopK.frontToesX,
-        hopK.halluxX,
-        -0.03
+        legRate,
+        legHipX,
+        legHockX,
+        legFootX,
+        legFrontX,
+        legHalluxX,
+        -0.03 * (1 - airTuckW)
       );
       this.applyLegJointPose(
         this.rightLegRig,
         dt,
-        28,
-        hopK.hipX * 0.97,
-        hopK.hockX * 0.97,
-        hopK.footX,
-        hopK.frontToesX,
-        hopK.halluxX,
-        0.03
+        legRate,
+        legHipX * 0.98,
+        legHockX * 0.98,
+        legFootX,
+        legFrontX,
+        legHalluxX,
+        0.03 * (1 - airTuckW)
       );
     } else if (p.mode === 'perched') {
       const slopeX = p.perchSlopeX ?? 0;
@@ -1749,9 +1940,10 @@ export class SparrowMesh {
       } else {
         this.bodyPivot.position.y += (targetBodyY - this.bodyPivot.position.y) * Math.min(1, dt * 24);
         this.bodyPivot.rotation.z = 0;
+        const perchPitch = flyPrime > 0.01 ? -0.46 : -0.09;
         this.bodyPivot.rotation.x +=
-          (-0.09 - bonk * 0.18 + peckPitch - this.bodyPivot.rotation.x) *
-          Math.min(1, dt * (peck > 0.01 || eat > 0.01 ? 30 : 22));
+          (perchPitch - bonk * 0.18 + peckPitch - this.bodyPivot.rotation.x) *
+          Math.min(1, dt * (flyPrime > 0.01 ? 36 : peck > 0.01 || eat > 0.01 ? 30 : 22));
 
         const ikL = this.solvePlantedLegIK(
           this.leftLegRig,
@@ -1792,9 +1984,10 @@ export class SparrowMesh {
       const targetBodyY = -0.018 + breathe + settleOffset + bonkHop - peckStrike * 0.024 - eatDip * 0.045;
       this.bodyPivot.position.y += (targetBodyY - this.bodyPivot.position.y) * Math.min(1, dt * 20);
       this.bodyPivot.rotation.z = 0;
+      const restPitch = flyPrime > 0.01 ? -0.46 : -0.07;
       this.bodyPivot.rotation.x +=
-        (-0.07 - bonk * 0.18 + peckPitch - this.bodyPivot.rotation.x) *
-        Math.min(1, dt * (peck > 0.01 || eat > 0.01 ? 26 : 14));
+        (restPitch - bonk * 0.18 + peckPitch - this.bodyPivot.rotation.x) *
+        Math.min(1, dt * (flyPrime > 0.01 ? 36 : peck > 0.01 || eat > 0.01 ? 26 : 14));
 
       const groundedFootY = -0.095 * bs[1] - 0.262;
       const groundedFootZ = -0.026 * bs[2] + 0.072;
@@ -1819,7 +2012,9 @@ export class SparrowMesh {
     }
 
     const hopArc = Math.sin(p.hopPhase * Math.PI);
-    const hopFlick = hopArc * 0.16 + bonk * 0.52 + peckStrike * 0.28 + eatDip * 0.22;
+    // During an airborne hop, shoulders cock slightly outward in readiness for immediate flight
+    const readyCock = hopAirborne ? 0.26 * Math.max(0.35, hopArc) : 0;
+    const hopFlick = hopArc * 0.18 + readyCock + bonk * 0.52 + peckStrike * 0.28 + eatDip * 0.22;
     const foldX = -0.48 + hopFlick * 0.35;
     const foldYL = -1.46 + hopFlick;
     const foldZL = 0.16 - hopFlick * 0.5;
@@ -1828,34 +2023,96 @@ export class SparrowMesh {
       p.mode === 'perched' && arrival > 0.001
         ? 1.0 - smoothBand(0.14, 0.92, 1.0 - arrival)
         : 0.0;
-    if (flareW > 0.001) {
+
+    if (flyPrime > 0.01) {
+      // Zero-delay 2nd-press anticipation: immediately unfurl wings to top of takeoff downstroke!
+      this.applyWingJointPose(
+        dt,
+        46,
+        0.12,
+        0.16,
+        -0.92,
+        0.12,
+        -0.16,
+        0.92,
+        0.06,
+        0.04,
+        -0.24,
+        0.06,
+        -0.04,
+        0.24
+      );
+    } else if (hopAirborne && p.flapTimer > 0.02) {
+      // Airborne flutter-hop (e.g., hopping off a perch or locked cage hop): crisp mini wingbeats
+      const miniStroke = 0.36 + Math.sin(p.elapsed * 28.0) * 0.42;
+      this.applyWingJointPose(
+        dt,
+        34,
+        0.06,
+        -0.25,
+        -miniStroke,
+        0.06,
+        0.25,
+        miniStroke,
+        0,
+        -0.08,
+        -0.18,
+        0,
+        0.08,
+        0.18
+      );
+    } else if (flareW > 0.001) {
       const flareStroke = 0.34 + Math.sin(p.elapsed * 30.0) * 0.36;
       const flareOuter = 0.22;
-      this.wingLeftInner.rotation.set(
-        0.44 * flareW + foldX * (1.0 - flareW),
-        0.06 * flareW + foldYL * (1.0 - flareW),
-        -flareStroke * flareW + foldZL * (1.0 - flareW)
+      this.applyWingJointPose(
+        dt,
+        30,
+        -0.42 * flareW + foldX * (1.0 - flareW),
+        0.12 * flareW + foldYL * (1.0 - flareW),
+        -flareStroke * flareW + foldZL * (1.0 - flareW),
+        -0.42 * flareW + foldX * (1.0 - flareW),
+        -0.12 * flareW - foldYL * (1.0 - flareW),
+        flareStroke * flareW - foldZL * (1.0 - flareW),
+        0,
+        -0.22 * (1.0 - flareW),
+        -flareOuter * flareW + 0.04 * (1.0 - flareW),
+        0,
+        0.22 * (1.0 - flareW),
+        flareOuter * flareW - 0.04 * (1.0 - flareW)
       );
-      this.wingRightInner.rotation.set(
-        0.44 * flareW + foldX * (1.0 - flareW),
-        -0.06 * flareW - foldYL * (1.0 - flareW),
-        flareStroke * flareW - foldZL * (1.0 - flareW)
-      );
-      this.wingLeftOuter.rotation.set(0, -0.22 * (1.0 - flareW), -flareOuter * flareW + 0.04 * (1.0 - flareW));
-      this.wingRightOuter.rotation.set(0, 0.22 * (1.0 - flareW), flareOuter * flareW - 0.04 * (1.0 - flareW));
     } else {
-      this.wingLeftInner.rotation.set(foldX, foldYL, foldZL);
-      this.wingRightInner.rotation.set(foldX, -foldYL, -foldZL);
-      this.wingLeftOuter.rotation.set(0, -0.22, 0.04);
-      this.wingRightOuter.rotation.set(0, 0.22, -0.04);
+      this.applyWingJointPose(
+        dt,
+        24,
+        foldX,
+        foldYL,
+        foldZL,
+        foldX,
+        -foldYL,
+        -foldZL,
+        0,
+        -0.22,
+        0.04,
+        0,
+        0.22,
+        -0.04
+      );
     }
 
     const tailBob =
       Math.sin(p.elapsed * 4.4) * 0.042 + hopArc * 0.24 + bonk * 0.35 + peckStrike * 0.28 + eatDip * 0.32;
-    const perchedTailX = 0.20 + tailBob;
-    this.tailPivot.rotation.x = -0.38 * flareW + perchedTailX * (1.0 - flareW);
+    const perchedTailX = flyPrime > 0.01 ? -0.18 : 0.20 + tailBob;
+    this.tailPivot.rotation.x +=
+      (-0.38 * flareW + perchedTailX * (1.0 - flareW) - this.tailPivot.rotation.x) * Math.min(1, dt * 24);
+    this.tailPivot.rotation.y += (0 - this.tailPivot.rotation.y) * Math.min(1, dt * 18);
     this.tailPivot.rotation.z = -p.bankAngle * 0.24 * flareW;
-    const fan = 0.040 + flareW * 0.105 + bonk * 0.13 + peckStrike * 0.06 + eatDip * 0.05;
+    const fan =
+      0.040 +
+      (flyPrime > 0.01 ? 0.065 : hopAirborne ? 0.032 : 0) +
+      flareW * 0.105 +
+      bonk * 0.13 +
+      peckStrike * 0.06 +
+      eatDip * 0.05;
     for (let idx = 0; idx < this.tailFeathers.length; idx++) {
       this.tailFeathers[idx].rotation.y = (idx - 3.0) * fan;
     }

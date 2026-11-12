@@ -50,23 +50,23 @@ function resolveMobileChips(prompt: TutorialPromptKey): MobileChipSpec[] | null 
       return [
         { gesture: 'DRAG', hint: 'Move', codes: ['TouchMove', 'KeyW', 'KeyA', 'KeyS', 'KeyD'] },
         { gesture: 'TAP', hint: 'Hop', codes: ['TouchTap', 'Space'] },
-        { gesture: 'LONG PRESS', hint: 'Fly', codes: ['TouchHold', 'Space'] },
+        { gesture: 'TAP + LONG PRESS', hint: 'Fly', codes: ['TouchTapHold'] },
       ];
     case 'MOBILE_DOOR':
       return [
         { gesture: 'DRAG', hint: 'To Cage Door', codes: ['TouchMove'] },
-        { gesture: 'LONG PRESS', hint: 'Fly', codes: ['TouchHold', 'Space'] },
+        { gesture: 'TAP + LONG PRESS', hint: 'Fly', codes: ['TouchTapHold'] },
       ];
     case 'SPACE':
       return [
-        { gesture: 'LONG PRESS', hint: 'Fly (30°)', codes: ['TouchHold', 'Space'] },
+        { gesture: 'TAP + LONG PRESS', hint: 'Fly (30°)', codes: ['TouchTapHold', 'Space'] },
         { gesture: 'DRAG UP', hint: 'Climb (60°)', codes: ['TouchMove', 'KeyW', 'ArrowUp'] },
-        { gesture: 'RELEASE', hint: 'Glide', codes: ['TouchTap'] },
+        { gesture: 'RELEASE', hint: 'Glide (-10°)', codes: ['TouchTap'] },
       ];
     case 'MOBILE_WINDOW':
     case 'CLICK':
       return [
-        { gesture: 'LONG PRESS', hint: 'Fly', codes: ['TouchHold', 'Space'] },
+        { gesture: 'TAP + LONG PRESS', hint: 'Fly', codes: ['TouchTapHold', 'Space'] },
         { gesture: 'DRAG', hint: 'Steer / Climb', codes: ['TouchMove'] },
       ];
     case 'Q':
@@ -78,9 +78,9 @@ function resolveMobileChips(prompt: TutorialPromptKey): MobileChipSpec[] | null 
 
 /**
  * Contextual indie tutorial overlay:
- * - Level start onboarding shows all 3 core controls: DRAG = Move, TAP = Hop, LONG PRESS = Fly
- * - Desktop: physical 4-square inverted-T cluster for WASD + gesture pills so both keyboard and mouse/touch players see Long Press = Fly
- * - Mobile: clean tactile touch gesture pills (DRAG Move · TAP Hop · LONG PRESS Fly)
+ * - Level start onboarding shows all 3 core controls: DRAG = Move, TAP = Hop, TAP + LONG PRESS = Fly
+ * - Desktop: physical 4-square inverted-T cluster for WASD + gesture pills so both keyboard and mouse/touch players see Tap + Long Press = Fly
+ * - Mobile: clean tactile touch gesture pills (DRAG Move · TAP Hop · TAP + LONG PRESS Fly)
  * Built with safe DOM APIs (createElement, textContent, replaceChildren; no innerHTML).
  */
 export class TutorialOverlay {
@@ -93,6 +93,8 @@ export class TutorialOverlay {
   private mobileMode = false;
   private activeKeyEls: Array<{ el: HTMLElement; codes: string[] }> = [];
   private holdTimer: number | null = null;
+  private recentTapAtMs = -10000;
+  private pressStartMs = 0;
 
   constructor(parent: HTMLElement) {
     this.root = document.createElement('div');
@@ -105,13 +107,39 @@ export class TutorialOverlay {
     this.root.appendChild(this.keyRow);
     parent.appendChild(this.root);
 
-    window.addEventListener('keydown', (e) => this.handleKeyState(e.code, true));
-    window.addEventListener('keyup', (e) => this.handleKeyState(e.code, false));
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat) return;
+      if (e.code === 'Space') {
+        const now = performance.now();
+        const hadRecentTap = now - this.recentTapAtMs <= 800;
+        this.pressStartMs = now;
+        if (hadRecentTap) {
+          this.startHoldFeedbackTimer();
+        }
+      }
+      this.handleKeyState(e.code, true);
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space') {
+        const now = performance.now();
+        if (now - this.pressStartMs <= 260) {
+          this.recentTapAtMs = now;
+        }
+        this.clearHoldFeedbackTimer();
+        this.handleKeyState('TouchTapHold', false);
+      }
+      this.handleKeyState(e.code, false);
+    });
     window.addEventListener('mousedown', (e) => {
       if (e.button === 0) {
+        const now = performance.now();
+        const hadRecentTap = now - this.recentTapAtMs <= 800;
+        this.pressStartMs = now;
         this.handleKeyState('MouseLeft', true);
         this.handleKeyState('TouchTap', true);
-        this.startHoldFeedbackTimer();
+        if (hadRecentTap) {
+          this.startHoldFeedbackTimer();
+        }
       }
     });
     window.addEventListener('mousemove', (e) => {
@@ -121,18 +149,27 @@ export class TutorialOverlay {
     });
     window.addEventListener('mouseup', (e) => {
       if (e.button === 0) {
+        const now = performance.now();
+        if (now - this.pressStartMs <= 260) {
+          this.recentTapAtMs = now;
+        }
         this.clearHoldFeedbackTimer();
         this.handleKeyState('MouseLeft', false);
         this.handleKeyState('TouchTap', false);
         this.handleKeyState('TouchMove', false);
-        this.handleKeyState('TouchHold', false);
+        this.handleKeyState('TouchTapHold', false);
       }
     });
     window.addEventListener(
       'touchstart',
       () => {
+        const now = performance.now();
+        const hadRecentTap = now - this.recentTapAtMs <= 800;
+        this.pressStartMs = now;
         this.handleKeyState('TouchTap', true);
-        this.startHoldFeedbackTimer();
+        if (hadRecentTap) {
+          this.startHoldFeedbackTimer();
+        }
       },
       { passive: true }
     );
@@ -144,10 +181,14 @@ export class TutorialOverlay {
       { passive: true }
     );
     const clearTouch = () => {
+      const now = performance.now();
+      if (now - this.pressStartMs <= 260) {
+        this.recentTapAtMs = now;
+      }
       this.clearHoldFeedbackTimer();
       this.handleKeyState('TouchTap', false);
       this.handleKeyState('TouchMove', false);
-      this.handleKeyState('TouchHold', false);
+      this.handleKeyState('TouchTapHold', false);
     };
     window.addEventListener('touchend', clearTouch, { passive: true });
     window.addEventListener('touchcancel', clearTouch, { passive: true });
@@ -165,8 +206,8 @@ export class TutorialOverlay {
   private startHoldFeedbackTimer(): void {
     this.clearHoldFeedbackTimer();
     this.holdTimer = window.setTimeout(() => {
-      this.handleKeyState('TouchHold', true);
-    }, 200);
+      this.handleKeyState('TouchTapHold', true);
+    }, 85);
   }
 
   private clearHoldFeedbackTimer(): void {

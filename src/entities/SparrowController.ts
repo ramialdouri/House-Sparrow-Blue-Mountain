@@ -223,7 +223,10 @@ export class SparrowController {
   private chirpQueued = false;
   private mobileControls: MobileTouchControls | null = null;
   public isLongPressFlying = false;
+  private flyHoldPrimed = false;
+  private hopToFlyWindow = 0;
   private mouseLongPressTimer: number | null = null;
+  private spaceLongPressTimer: number | null = null;
   private lastCameraYaw = 0;
   private mobileDropIgnoreGrabTimer = 0;
   private mobileWindowPushCooldown = 0;
@@ -327,7 +330,9 @@ export class SparrowController {
     this.keys.clear();
     this.holdingMouseLeft = false;
     this.isLongPressFlying = false;
+    this.flyHoldPrimed = false;
     this.clearMouseLongPressTimer();
+    this.clearSpaceLongPressTimer();
     this.jumpBufferTimer = 0;
   }
 
@@ -338,27 +343,83 @@ export class SparrowController {
     }
   }
 
+  private clearSpaceLongPressTimer(): void {
+    if (this.spaceLongPressTimer !== null) {
+      window.clearTimeout(this.spaceLongPressTimer);
+      this.spaceLongPressTimer = null;
+    }
+  }
+
+  private isHopReadyToChainFlight(): boolean {
+    return this.isHopAirborne || this.hopToFlyWindow > 0;
+  }
+
+  private launchFromLongPressHold(): void {
+    if (!this.inputEnabled || this.dizzyState !== 'none') return;
+    this.flyHoldPrimed = false;
+    this.isLongPressFlying = true;
+    if (this.mode !== 'flying') {
+      const axes = this.getMoveAxes();
+      _fwd.set(Math.sin(this.lastCameraYaw), 0, Math.cos(this.lastCameraYaw)).normalize();
+      _right.set(-Math.cos(this.lastCameraYaw), 0, Math.sin(this.lastCameraYaw)).normalize();
+      _moveDir.set(0, 0, 0).addScaledVector(_fwd, axes.forward).addScaledVector(_right, axes.right);
+      if (_moveDir.lengthSq() > 1) _moveDir.normalize();
+      this.transitionHopToFlight(_moveDir);
+    } else {
+      this.wingTuckAmount = 0;
+      this.flapAnimTimer = Math.max(this.flapAnimTimer, 0.55);
+    }
+  }
+
   public initiateGlideMechanics(): void {
+    this.flyHoldPrimed = false;
     this.wingTuckAmount = 0.0;
     this.boundCycleTimer = 0.0;
     this.flapAnimTimer = 0.0;
-    // If releasing from an upward 30°–60° climb, smoothly arc excess vertical climb into forward glide momentum
-    if (this.velocity.y > 2.2) {
-      const bonusFwd = (this.velocity.y - 1.8) * 0.42;
-      this.velocity.y = 1.6;
-      const fwd = this.getForwardVector(_actionFwd);
-      this.velocity.x += fwd.x * bonusFwd;
-      this.velocity.z += fwd.z * bonusFwd;
-    } else if (this.velocity.y < -3.5) {
-      // If releasing from a downward dive, convert excess downward kinetic speed into a buoyant forward swoop
-      const shedDown = Math.max(0, -this.velocity.y - 3.0);
-      this.velocity.y = -2.2;
-      const fwd = this.getForwardVector(_actionFwd);
-      this.velocity.x += fwd.x * (shedDown * 0.50);
-      this.velocity.z += fwd.z * (shedDown * 0.50);
+
+    const fwd = this.getForwardVector(_actionFwd);
+    const curHSpeed = Math.hypot(this.velocity.x, this.velocity.z);
+
+    if (this.velocity.y > 1.2) {
+      // Smoothly crest out of a 30°–60° upward climb into a buoyant -10° paraglider glide
+      const bonusFwd = (this.velocity.y - 1.2) * 0.48;
+      this.velocity.y = Math.min(this.velocity.y, 2.1);
+      const targetH = Math.max(11.8, curHSpeed + bonusFwd);
+      if (curHSpeed > 0.2) {
+        const scale = targetH / curHSpeed;
+        this.velocity.x *= scale;
+        this.velocity.z *= scale;
+      } else {
+        this.velocity.x = fwd.x * targetH;
+        this.velocity.z = fwd.z * targetH;
+      }
+    } else if (this.velocity.y < -3.0) {
+      // Convert downward dive energy into a long, flat -10° paraglider swoop
+      const shedDown = Math.max(0, -this.velocity.y - 2.1);
+      this.velocity.y = -2.1;
+      const targetH = Math.min(24.5, Math.max(12.2, curHSpeed + shedDown * 0.55));
+      if (curHSpeed > 0.2) {
+        const scale = targetH / curHSpeed;
+        this.velocity.x *= scale;
+        this.velocity.z *= scale;
+      } else {
+        this.velocity.x = fwd.x * targetH;
+        this.velocity.z = fwd.z * targetH;
+      }
       this.fx.spawnBurst(this.position, 3, false, 1.8);
+    } else if (curHSpeed < 11.6) {
+      // Keep canopy pressurized at paraglider trim airspeed so releasing never stalls downward
+      const targetH = 11.6;
+      if (curHSpeed > 0.2) {
+        const scale = targetH / curHSpeed;
+        this.velocity.x *= scale;
+        this.velocity.z *= scale;
+      } else {
+        this.velocity.x = fwd.x * targetH;
+        this.velocity.z = fwd.z * targetH;
+      }
     }
-    this.audio.playFlightWingbeat(0.20);
+    this.audio.playFlightWingbeat(0.16);
   }
 
   public clearQueuedInputs(): void {
@@ -380,12 +441,24 @@ export class SparrowController {
   public attachMobileControls(controls: MobileTouchControls): void {
     this.mobileControls = controls;
     controls.isBirdFlying = () => this.mode === 'flying';
+    controls.isBirdHopReadyToFly = () => this.isHopReadyToChainFlight();
     controls.onFirstInteract = () => {
       this.wakeAudio();
+    };
+    controls.onFlyHoldPrime = (primed: boolean) => {
+      if (!this.inputEnabled || this.dizzyState !== 'none') {
+        this.flyHoldPrimed = false;
+        return;
+      }
+      this.flyHoldPrimed = primed;
+      if (primed && this.mode === 'flying') {
+        this.flapAnimTimer = Math.max(this.flapAnimTimer, 0.35);
+      }
     };
     controls.onTapJump = () => {
       if (!this.inputEnabled) return;
       this.wakeAudio();
+      this.flyHoldPrimed = false;
       if (this.dizzyState === 'grounded') {
         this.dizzyTimer = Math.max(0.08, this.dizzyTimer - 0.08);
         return;
@@ -396,17 +469,10 @@ export class SparrowController {
     controls.onLongPressStart = () => {
       if (!this.inputEnabled || this.dizzyState !== 'none') return;
       this.wakeAudio();
-      this.isLongPressFlying = true;
-      if (this.mode !== 'flying') {
-        const axes = this.getMoveAxes();
-        _fwd.set(Math.sin(this.lastCameraYaw), 0, Math.cos(this.lastCameraYaw)).normalize();
-        _right.set(-Math.cos(this.lastCameraYaw), 0, Math.sin(this.lastCameraYaw)).normalize();
-        _moveDir.set(0, 0, 0).addScaledVector(_fwd, axes.forward).addScaledVector(_right, axes.right);
-        if (_moveDir.lengthSq() > 1) _moveDir.normalize();
-        this.transitionHopToFlight(_moveDir);
-      }
+      this.launchFromLongPressHold();
     };
     controls.onLongPressEnd = () => {
+      this.flyHoldPrimed = false;
       this.isLongPressFlying = false;
       if (this.mode === 'flying') {
         this.initiateGlideMechanics();
@@ -450,8 +516,25 @@ export class SparrowController {
 
       if (!this.keys.has(code)) {
         if (code === 'Space') {
-          this.jumpQueued = true;
-          this.jumpBufferTimer = 0.10;
+          if (this.mode === 'flying' || this.isHopReadyToChainFlight()) {
+            // 2nd press of Tap + Long Press (or re-engaging powered flight while gliding):
+            // Immediately prime wings at 0ms, and engage 30°–60° flight after 85ms hold!
+            this.flyHoldPrimed = true;
+            if (this.mode === 'flying') {
+              this.flapAnimTimer = Math.max(this.flapAnimTimer, 0.35);
+            }
+            this.clearSpaceLongPressTimer();
+            this.spaceLongPressTimer = window.setTimeout(() => {
+              this.spaceLongPressTimer = null;
+              if (this.keys.has('Space') && this.inputEnabled && this.dizzyState === 'none') {
+                this.launchFromLongPressHold();
+              }
+            }, 85);
+          } else {
+            // 1st press from rest: crisp Hop first (priming hopToFlyWindow for follow-up Long Press)
+            this.jumpQueued = true;
+            this.jumpBufferTimer = 0.12;
+          }
         }
         if (code === 'KeyE' || code === 'KeyF') {
           this.interactQueued = true;
@@ -471,8 +554,20 @@ export class SparrowController {
         return;
       }
       this.keys.delete(e.code);
-      if (e.code === 'Space' && this.mode === 'flying') {
-        this.initiateGlideMechanics();
+      if (e.code === 'Space') {
+        const hadPendingHoldTimer = this.spaceLongPressTimer !== null;
+        this.clearSpaceLongPressTimer();
+        this.flyHoldPrimed = false;
+        if (this.isLongPressFlying) {
+          this.isLongPressFlying = false;
+          if (this.mode === 'flying') {
+            this.initiateGlideMechanics();
+          }
+        } else if (hadPendingHoldTimer) {
+          // Released before 85ms hold confirmation -> quick follow-up tap (single flap / flutter hop)
+          this.jumpQueued = true;
+          this.jumpBufferTimer = 0.10;
+        }
       }
     });
 
@@ -496,25 +591,23 @@ export class SparrowController {
         this.holdingMouseLeft = true;
         this.interactQueued = true;
         this.clearMouseLongPressTimer();
-        this.mouseLongPressTimer = window.setTimeout(() => {
-          if (this.holdingMouseLeft && this.inputEnabled && this.dizzyState === 'none') {
-            this.isLongPressFlying = true;
-            if (this.mode !== 'flying') {
-              const axes = this.getMoveAxes();
-              _fwd.set(Math.sin(this.lastCameraYaw), 0, Math.cos(this.lastCameraYaw)).normalize();
-              _right.set(-Math.cos(this.lastCameraYaw), 0, Math.sin(this.lastCameraYaw)).normalize();
-              _moveDir.set(0, 0, 0).addScaledVector(_fwd, axes.forward).addScaledVector(_right, axes.right);
-              if (_moveDir.lengthSq() > 1) _moveDir.normalize();
-              this.transitionHopToFlight(_moveDir);
+        // Pointer-locked left click only launches flight if already flying or within hop-ready window (Tap + Long Press)
+        if (this.mode === 'flying' || this.isHopReadyToChainFlight()) {
+          this.flyHoldPrimed = true;
+          this.mouseLongPressTimer = window.setTimeout(() => {
+            this.mouseLongPressTimer = null;
+            if (this.holdingMouseLeft && this.inputEnabled && this.dizzyState === 'none') {
+              this.launchFromLongPressHold();
             }
-          }
-        }, 200);
+          }, 85);
+        }
       }
     });
 
     window.addEventListener('mouseup', (e) => {
       if (e.button === 0) {
         this.holdingMouseLeft = false;
+        this.flyHoldPrimed = false;
         this.clearMouseLongPressTimer();
         if (this.isLongPressFlying) {
           this.isLongPressFlying = false;
@@ -1142,7 +1235,9 @@ export class SparrowController {
 
     this.leavePerch(true);
     this.isHopAirborne = false;
+    this.hopToFlyWindow = 0;
     this.multiSpaceWindow = 0;
+    this.flyHoldPrimed = false;
     this.mode = 'flying';
     const fwd = this.getForwardVector(_birdFwd);
     const hasInput = moveDir.lengthSq() > 0.08;
@@ -1151,19 +1246,21 @@ export class SparrowController {
       this.yaw = Math.atan2(pushDir.x, pushDir.z);
     }
 
-    // Launch at 30° upward angle on long press (scaling up to 60° if already dragging upward)
+    // Launch at 30° upward angle on Tap + Long Press (scaling up to 60° if already dragging upward)
     const stick = this.mobileControls?.stick;
-    const upDrag = stick?.active ? Math.max(0, Math.min(1, stick.y)) : 0;
+    const keyClimb =
+      this.isLongPressFlying && (this.keys.has('KeyW') || this.keys.has('ArrowUp')) ? 1.0 : 0;
+    const upDrag = stick?.active ? Math.max(0, Math.min(1, stick.y)) : keyClimb;
     const climbAngleRad = THREE.MathUtils.degToRad(30 + upDrag * 30);
-    const launchSpeed = this.cageBounds?.locked ? 6.8 : 11.4;
+    const launchSpeed = this.cageBounds?.locked ? 6.8 : 11.8;
     const forwardSpeed = launchSpeed * Math.cos(climbAngleRad);
     const verticalSpeed = launchSpeed * Math.sin(climbAngleRad);
 
     this.velocity.set(pushDir.x * forwardSpeed, verticalSpeed, pushDir.z * forwardSpeed);
     this.pitchAngle = -climbAngleRad;
     this.flapAnimTimer = 0.85;
-    this.flapCooldown = 0.16;
-    this.flightWingbeatTimer = 0.12;
+    this.flapCooldown = 0.14;
+    this.flightWingbeatTimer = 0.10;
     this.audio.playWingFlap(0.85);
     this.worldHandles?.applyAerodynamicWash?.(this.position, this.velocity, 0.85);
     this.physics.applyWindGustAt(this.position, this.velocity, 3.6, 0.85);
@@ -1268,6 +1365,7 @@ export class SparrowController {
     if (this.bonkTimer > 0) this.bonkTimer = Math.max(0, this.bonkTimer - clampedDt);
     if (this.bonkCooldown > 0) this.bonkCooldown = Math.max(0, this.bonkCooldown - clampedDt);
     if (this.multiSpaceWindow > 0) this.multiSpaceWindow = Math.max(0, this.multiSpaceWindow - clampedDt);
+    if (this.hopToFlyWindow > 0) this.hopToFlyWindow = Math.max(0, this.hopToFlyWindow - clampedDt);
     if (this.jumpBufferTimer > 0) this.jumpBufferTimer = Math.max(0, this.jumpBufferTimer - clampedDt);
     if (this.peckTimer > 0) this.peckTimer = Math.max(0, this.peckTimer - clampedDt);
     if (this.eatTimer > 0) this.eatTimer = Math.max(0, this.eatTimer - clampedDt);
@@ -1282,7 +1380,9 @@ export class SparrowController {
       this.coyoteTimer = Math.max(0, this.coyoteTimer - clampedDt);
     }
 
-    if (this.mode !== 'flying') {
+    if (this.mode === 'flying') {
+      this.hopToFlyWindow = 0;
+    } else {
       this.flightStamina = Math.min(1.0, this.flightStamina + clampedDt * 1.45);
       this.wingTuckAmount = 0;
     }
@@ -1468,6 +1568,10 @@ export class SparrowController {
       elapsed,
       mode: this.mode,
       isBraking: this.mode === 'flying' && axesNow.braking,
+      isDiving: this.mode === 'flying' && axesNow.diving,
+      airspeed: this.velocity.length(),
+      hopAirborne: this.isHopAirborne,
+      flyHoldPrime: this.flyHoldPrimed ? 1.0 : 0.0,
       wingTuck: this.wingTuckAmount,
       bonkPhase: this.bonkTimer > 0 ? this.bonkTimer / 0.5 : 0,
       dizzyState: this.dizzyState,
@@ -1802,10 +1906,7 @@ export class SparrowController {
     _perchTan.copy(_perchAB).divideScalar(segLen);
 
     if (this.hasBufferedJump()) {
-      if (!this.cageBounds?.locked || this.multiSpaceWindow > 0) {
-        this.transitionHopToFlight(moveDir);
-        return;
-      }
+      // Sparrow must always HOP first from a perch before flying (Tap = Hop, Tap + Long Press = Fly)
       this.consumeBufferedJump();
       this.coyoteTimer = 0;
       const inCage = this.isInsideBirdcage(this.position);
@@ -1813,21 +1914,22 @@ export class SparrowController {
       this.perchIgnoreTimer = Math.max(this.perchIgnoreTimer, inCage ? 0.45 : 0.34);
       this.mode = 'grounded';
       this.isHopAirborne = true;
-      this.multiSpaceWindow = this.isMobileInputActive() ? 0.54 : 0.44;
-      this.perchHopFloatTimer = inCage ? 0.75 : isInsideAtelier(this.position) ? 0.44 : 0.24;
+      this.hopToFlyWindow = 0.72;
+      this.multiSpaceWindow = 0.72;
+      this.perchHopFloatTimer = inCage ? 0.75 : isInsideAtelier(this.position) ? 0.44 : 0.30;
       const indoors = isInsideAtelier(this.position);
       const fwd = this.getForwardVector(_birdFwd);
       const hasInput = moveDir.lengthSq() > 0.08;
-      const hopHoriz = hasInput ? (inCage ? 2.15 : indoors ? 2.65 : 3.8) : inCage ? 1.35 : 0.42;
+      const hopHoriz = hasInput ? (inCage ? 2.15 : indoors ? 2.85 : 4.2) : inCage ? 1.35 : 0.95;
       const dir = hasInput ? moveDir : fwd;
       this.velocity.set(
         dir.x * hopHoriz,
-        inCage ? 2.35 : indoors ? 4.2 : 5.0,
+        inCage ? 2.35 : indoors ? 4.4 : 5.2,
         dir.z * hopHoriz
       );
-      this.hopPhase = 0.16;
-      this.flapAnimTimer = Math.max(this.flapAnimTimer, inCage ? 0.42 : 0.28);
-      this.audio.playFlightWingbeat(0.24);
+      this.hopPhase = 0.20; // Skip crouch phase for instant liftoff reaction
+      this.flapAnimTimer = Math.max(this.flapAnimTimer, inCage ? 0.42 : 0.24);
+      this.audio.playFlightWingbeat(0.22);
       this.audio.playHop(seg.surface);
       return;
     }
@@ -1978,26 +2080,29 @@ export class SparrowController {
 
   private updateGrounded(dt: number, moveDir: THREE.Vector3): void {
     const indoors = isInsideAtelier(this.position);
-    if (
-      this.hasBufferedJump() ||
-      (this.isHopAirborne && this.keys.has('Space') && !this.cageBounds?.locked)
-    ) {
-      if (this.isHopAirborne || this.multiSpaceWindow > 0) {
-        this.transitionHopToFlight(moveDir);
-        return;
-      }
-
+    if (this.hasBufferedJump()) {
       this.consumeBufferedJump();
       this.coyoteTimer = 0;
+      const wasAlreadyHopReady = this.isHopAirborne || this.hopToFlyWindow > 0;
       this.isHopAirborne = true;
-      this.multiSpaceWindow = this.isMobileInputActive() ? 0.54 : 0.44;
+      this.hopToFlyWindow = 0.72;
+      this.multiSpaceWindow = 0.72;
       const fwd = this.getForwardVector(_birdFwd);
       const hasInput = moveDir.lengthSq() > 0.05;
-      const hopHoriz = hasInput ? (indoors ? 2.95 : 4.4) : 0.34;
+      const hopHoriz = hasInput ? (indoors ? 3.1 : 4.6) : wasAlreadyHopReady ? 1.6 : 0.65;
       const dir = hasInput ? moveDir : fwd;
-      this.velocity.set(dir.x * hopHoriz, indoors ? 4.8 : 5.6, dir.z * hopHoriz);
-      this.hopPhase = 0.16;
-      this.audio.playHop(this.detectGroundSurfaceType(this.position));
+      this.velocity.set(
+        dir.x * hopHoriz,
+        wasAlreadyHopReady ? (indoors ? 4.5 : 5.2) : indoors ? 4.9 : 5.7,
+        dir.z * hopHoriz
+      );
+      this.hopPhase = 0.20; // Instant liftoff frame ready to chain into flight with 0ms delay
+      if (wasAlreadyHopReady) {
+        this.flapAnimTimer = Math.max(this.flapAnimTimer, 0.28);
+        this.audio.playWingFlap(0.55);
+      } else {
+        this.audio.playHop(this.detectGroundSurfaceType(this.position));
+      }
       _fxPos.set(this.position.x, this.position.y - 0.34, this.position.z);
       this.fx.spawnBurst(_fxPos, 3, false, 1.5);
     }
@@ -2040,27 +2145,32 @@ export class SparrowController {
     } else {
       const inCageAir = this.isInsideBirdcage(this.position);
       const floatBlend = Math.min(1, this.perchHopFloatTimer * 2.5);
-      this.hopPhase = Math.min(0.95, this.hopPhase + dt * (floatBlend > 0.05 ? 1.55 : 2.2));
+      this.hopPhase = Math.min(0.95, this.hopPhase + dt * (floatBlend > 0.05 ? 1.55 : 2.15));
       if (moveDir.lengthSq() > 0.04) {
         const desiredYaw = Math.atan2(moveDir.x, moveDir.z);
         let diff = desiredYaw - this.yaw;
         while (diff > Math.PI) diff -= Math.PI * 2;
         while (diff < -Math.PI) diff += Math.PI * 2;
-        this.yaw += diff * Math.min(1, dt * 8.0);
-        const airHopSteer = inCageAir ? 2.25 : indoors ? 3.2 : 4.8;
-        const steerRate = floatBlend > 0.05 ? 3.4 : 5.0;
+        this.yaw += diff * Math.min(1, dt * 9.0);
+        const airHopSteer = inCageAir ? 2.25 : indoors ? 3.4 : 5.2;
+        const steerRate = floatBlend > 0.05 ? 3.8 : 5.5;
         this.velocity.x += (moveDir.x * airHopSteer - this.velocity.x) * Math.min(1, dt * steerRate);
         this.velocity.z += (moveDir.z * airHopSteer - this.velocity.z) * Math.min(1, dt * steerRate);
       }
       if (floatBlend > 0.05) {
         this.flapAnimTimer = Math.max(this.flapAnimTimer, 0.22 * floatBlend);
       }
-      const effectiveGrav = 24.5 - floatBlend * 12.6;
-      this.velocity.y -= effectiveGrav * dt;
-      if (floatBlend > 0.05) {
-        const terminalFall = inCageAir ? -4.15 : -5.6;
-        if (this.velocity.y < terminalFall) {
-          this.velocity.y += (terminalFall - this.velocity.y) * Math.min(1, dt * 11.5 * floatBlend);
+      if (this.flyHoldPrimed) {
+        // Zero-delay hover cushion during the 85ms follow-up press confirmation so the bird never drops before flying
+        this.velocity.y = Math.max(this.velocity.y, 2.2);
+      } else {
+        const effectiveGrav = 24.0 - floatBlend * 12.6;
+        this.velocity.y -= effectiveGrav * dt;
+        if (floatBlend > 0.05) {
+          const terminalFall = inCageAir ? -4.15 : -5.6;
+          if (this.velocity.y < terminalFall) {
+            this.velocity.y += (terminalFall - this.velocity.y) * Math.min(1, dt * 11.5 * floatBlend);
+          }
         }
       }
     }
@@ -2354,10 +2464,9 @@ export class SparrowController {
     const fwdX = Math.sin(this.yaw);
     const fwdZ = Math.cos(this.yaw);
     let hSpeed = Math.hypot(this.velocity.x, this.velocity.z);
-    const isLongPressing = this.isLongPressFlying || (this.mobileControls?.isLongPressActive() ?? false);
-    const holdingFlapCruise =
-      (this.keys.has('Space') || axes.mobileClimb > 0.02 || (isLongPressing && !axes.diving)) &&
-      this.flightStamina > 0.05;
+    const isLongPressing =
+      this.isLongPressFlying || (this.mobileControls?.isLongPressActive() ?? false);
+    const holdingFlapCruise = isLongPressing && !axes.diving && this.flightStamina > 0.05;
 
     if (this.bonkTimer <= 0.35) {
       if (axes.braking) {
@@ -2411,38 +2520,46 @@ export class SparrowController {
         }
 
         const targetPitch = -climbAngleRad; // -30° (-0.5236 rad) to -60° (-1.0472 rad)
-        this.pitchAngle += (targetPitch - this.pitchAngle) * Math.min(1, dt * 10.5);
+        this.pitchAngle += (targetPitch - this.pitchAngle) * Math.min(1, dt * 11.5);
       } else {
-        // Natural glide / dive-to-glide swoop pullout
+        // Paraglider Glide (~ -10° buoyant glide slope, L/D ≈ 5.67:1):
+        // Maintains pressurized forward canopy airspeed (~11.8 m/s) instead of stalling into a steep drop
         this.wingTuckAmount = 0.0;
-        const targetCruise = axes.forward > 0.1 ? 11.8 : Math.max(6.2, hSpeed * Math.pow(0.62, dt));
-        const dragRate = hSpeed > 13.0 ? 1.25 : 3.0;
-        hSpeed += (targetCruise - hSpeed) * Math.min(1, dt * dragRate);
+        const trimCruise = axes.forward > 0.1 ? 12.8 : 11.8;
+        const dragRate = hSpeed > trimCruise + 0.8 ? 0.55 : 3.8;
+        hSpeed += (trimCruise - hSpeed) * Math.min(1, dt * dragRate);
 
-        // Aerodynamic speed-lift: forward airspeed over wings creates lift opposing gravity
-        const speedLift = Math.min(10.6, Math.max(0, (hSpeed - 3.8) * 0.75));
-        const effectiveGravity = Math.max(1.8, (12.2 + weightPenalty) - speedLift);
-        const terminalSink = -7.8 - weightPenalty * 0.5;
+        // High swoop speed from a dive temporarily flattens glide slope down to -6°, settling smoothly to -10.0°
+        const baseGlideDeg = 10.0 + weightPenalty * 1.35;
+        const swoopBonusDeg = Math.min(4.0, Math.max(0, hSpeed - 13.2) * 0.42);
+        const glideAngleRad = THREE.MathUtils.degToRad(baseGlideDeg - swoopBonusDeg);
+        const targetGlideVy = -Math.max(6.5, hSpeed) * Math.tan(glideAngleRad);
 
-        if (this.velocity.y < -8.4) {
-          const nextVy = this.velocity.y + (-8.4 - this.velocity.y) * Math.min(1, dt * 8.5);
+        if (this.velocity.y < targetGlideVy - 0.6) {
+          // Pulling out of a steep dive: wings convert downward speed into forward swoop lift
+          const nextVy = this.velocity.y + (targetGlideVy - this.velocity.y) * Math.min(1, dt * 8.2);
           const shedDown = Math.max(0, nextVy - this.velocity.y);
           this.velocity.y = nextVy;
-          hSpeed = Math.min(26.5, hSpeed + shedDown * 0.45);
+          hSpeed = Math.min(26.5, hSpeed + shedDown * 0.48);
+        } else if (this.velocity.y > targetGlideVy) {
+          // Cresting gently from a 30°–60° climb into the -10° paraglider slope
+          this.velocity.y = Math.max(targetGlideVy, this.velocity.y - (6.8 + weightPenalty * 0.7) * dt);
         } else {
-          this.velocity.y = Math.max(terminalSink, this.velocity.y - effectiveGravity * dt);
+          this.velocity.y += (targetGlideVy - this.velocity.y) * Math.min(1, dt * 7.5);
         }
 
         // Natural stamina recovery while gliding:
-        this.flightStamina = Math.min(1.0, this.flightStamina + dt * 0.28);
+        this.flightStamina = Math.min(1.0, this.flightStamina + dt * 0.32);
 
-        const climbRatio = Math.max(-0.78, Math.min(0.78, -this.velocity.y / 11.5));
-        this.pitchAngle += (climbRatio - this.pitchAngle) * Math.min(1, dt * 6.5);
+        // Align body attitude along the -10° flight path with ~1.8° positive wing angle-of-attack (~ +8.2° pitch)
+        const pathPitch = Math.atan2(-this.velocity.y, Math.max(4.5, hSpeed));
+        const targetGlidePitch = Math.max(-0.45, Math.min(0.22, pathPitch - 0.032));
+        this.pitchAngle += (targetGlidePitch - this.pitchAngle) * Math.min(1, dt * 8.5);
       }
 
       const curDirX = hSpeed > 0.01 ? this.velocity.x / hSpeed : fwdX;
       const curDirZ = hSpeed > 0.01 ? this.velocity.z / hSpeed : fwdZ;
-      const steerBlend = Math.min(1, dt * 7.5);
+      const steerBlend = Math.min(1, dt * 7.8);
       _nextDir2.set(
         curDirX + (fwdX - curDirX) * steerBlend,
         curDirZ + (fwdZ - curDirZ) * steerBlend
@@ -2454,20 +2571,15 @@ export class SparrowController {
       this.velocity.y -= 14.0 * dt;
     }
 
-    // Subtle rhythmic wingbeat foley while flying (active flap, airbrake flutter, or gentle flight flutter)
+    // Wingbeat foley only fires during active wingbeats or airbraking — passive -10° paraglider glide stays serene!
     this.flightWingbeatTimer -= dt;
     if (this.flightWingbeatTimer <= 0 && !axes.diving && this.wingTuckAmount < 0.42) {
-      if (this.flapAnimTimer > 0.01) {
-        this.flightWingbeatTimer = 0.078;
+      if (this.flapAnimTimer > 0.02) {
+        this.flightWingbeatTimer = 0.076;
         this.audio.playFlightWingbeat(0.42 + 0.28 * Math.min(1.0, this.flapAnimTimer / 0.82));
       } else if (axes.braking) {
         this.flightWingbeatTimer = 0.088;
         this.audio.playFlightWingbeat(0.46);
-      } else {
-        const cruiseFactor = Math.min(1.0, hSpeed / 15.0);
-        this.flightWingbeatTimer =
-          (axes.forward > 0.1 ? 0.125 : 0.158) + Math.random() * 0.024;
-        this.audio.playFlightWingbeat(0.22 + 0.14 * cruiseFactor);
       }
     }
 
