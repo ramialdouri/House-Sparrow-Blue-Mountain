@@ -185,6 +185,7 @@ export async function startGameApp(loadingScreen: LoadingScreen): Promise<void> 
     fx,
     wakeAudio
   );
+  sparrow.camera = birdCam.camera;
   sparrow.cageBounds = worldHandles.cageBounds;
   sparrow.windowBarrier = worldHandles.windowBarrier;
   sparrow.npcs = npcs;

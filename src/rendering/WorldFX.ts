@@ -3,6 +3,9 @@ import { PALETTE } from './Palette.ts';
 import { createUnlitPastelFXMaterial, createPastelMaterial } from './StorybookMaterial.ts';
 import {
   extrudeShape,
+  taperedTube,
+  transformGeo,
+  mergeParts,
   buildCloudClusterGeometry,
   buildCeramicShardGeometry,
   buildDroppingProjectileGeometry,
@@ -11,7 +14,6 @@ import {
 
 const RING_POOL_SIZE = 24;
 const SHARD_POOL_SIZE = 24;
-const WING_TRAIL_POOL_SIZE = 96;
 const PETAL_COUNT = 95;
 const SPLAT_RING_BUFFER_SIZE = 64;
 
@@ -25,6 +27,8 @@ const _parentWorldScale = new THREE.Vector3();
 const _eulerScratch = new THREE.Euler();
 const _scaleScratch = new THREE.Vector3();
 const _upVec = new THREE.Vector3(0, 1, 0);
+const _arcOffsetScratch = new THREE.Vector3();
+const _arcLocalQuat = new THREE.Quaternion();
 const _zeroMat4 = new THREE.Matrix4().makeScale(0, 0, 0);
 
 interface RingPulse {
@@ -96,16 +100,9 @@ interface DriftingCloud {
   phase: number;
 }
 
-interface WingTrailSlot {
-  pos: THREE.Vector3;
-  quat: THREE.Quaternion;
-  age: number;
-  active: boolean;
-}
-
 /**
  * Untextured gouache visual effects across the multi-block neighborhood:
- * - GPU-instanced high-altitude cumulus clouds, sakura petals, wingtip trails & particle bursts
+ * - GPU-instanced high-altitude cumulus clouds, sakura petals & particle bursts
  * - Expanding 3D Chirp Sound Rings & Water Ripples
  * - Head-tracking Orbiting Golden Dizzy Stars during wall-hit fall & ground recovery
  * - Persistent 64-slot gouache splat ring buffer capable of riding on moving vehicles & citizens
@@ -119,15 +116,13 @@ export class WorldFX {
   private clouds: DriftingCloud[] = [];
   private cloudInstMeshes: THREE.InstancedMesh[] = [];
   private petalInst!: THREE.InstancedMesh;
-  private wingTrailInst!: THREE.InstancedMesh;
-  private wingTrailSlots: WingTrailSlot[] = [];
-  private wingTrailActiveCount = 0;
 
   private dustPuffPool!: InstancedParticlePool;
   private goldPuffPool!: InstancedParticlePool;
   private crumbCrustPool!: InstancedParticlePool;
   private crumbSoftPool!: InstancedParticlePool;
   private featherPool!: InstancedParticlePool;
+  private wingFlutterArcPool!: InstancedParticlePool;
   private petalBurstPool!: InstancedParticlePool;
   private waterDropPool!: InstancedParticlePool;
 
@@ -138,6 +133,7 @@ export class WorldFX {
   private flatRingGeo: THREE.BufferGeometry;
   private puffGeo: THREE.BufferGeometry;
   private featherGeo: THREE.BufferGeometry;
+  private wingFlutterArcGeo: THREE.BufferGeometry;
   private starGeo: THREE.BufferGeometry;
   private dizzyOrbitRingGeo: THREE.BufferGeometry;
   private droppingProjGeo: THREE.BufferGeometry;
@@ -146,6 +142,7 @@ export class WorldFX {
   private puffMatGold: THREE.NodeMaterial;
   private puffMatDust: THREE.NodeMaterial;
   private featherMat: THREE.NodeMaterial;
+  private wingFlutterArcMat: THREE.MeshBasicNodeMaterial;
   private splatMat: THREE.NodeMaterial;
   private cloudMat: THREE.NodeMaterial;
   private dizzyOrbitRingMat: THREE.MeshBasicNodeMaterial;
@@ -154,7 +151,6 @@ export class WorldFX {
 
   private ringCursor = 0;
   private shardCursor = 0;
-  private wingTrailCursor = 0;
   private shardGeoCache = new Map<string, THREE.BufferGeometry>();
 
   private splatRing: THREE.Mesh[] = [];
@@ -173,11 +169,74 @@ export class WorldFX {
     this.puffGeo = new THREE.SphereGeometry(0.17, 10, 8);
     this.puffGeo.deleteAttribute('uv');
 
-    const fShape = new THREE.Shape();
-    fShape.moveTo(0, 0.16);
-    fShape.bezierCurveTo(0.08, 0.1, 0.08, -0.08, 0, -0.16);
-    fShape.bezierCurveTo(-0.08, -0.08, -0.08, 0.1, 0, 0.16);
-    this.featherGeo = extrudeShape(fShape, 0.012, 0.005, PALETTE.sparrowCheek, 5);
+    // Multi-part sculpted 3D songbird contour feather (curved ivory rachis quill + asymmetric cinnamon/buff vanes)
+    const outerVane = new THREE.Shape();
+    outerVane.moveTo(0, -0.15);
+    outerVane.bezierCurveTo(-0.042, -0.05, -0.048, 0.08, -0.004, 0.175);
+    outerVane.lineTo(0.003, 0.165);
+    outerVane.lineTo(0.002, -0.15);
+    outerVane.closePath();
+
+    const innerVane = new THREE.Shape();
+    innerVane.moveTo(0, -0.15);
+    innerVane.bezierCurveTo(0.072, -0.07, 0.084, 0.05, 0.036, 0.125);
+    innerVane.lineTo(0.012, 0.118);
+    innerVane.bezierCurveTo(0.048, 0.145, 0.026, 0.168, 0.0, 0.175);
+    innerVane.lineTo(-0.002, -0.15);
+    innerVane.closePath();
+
+    this.featherGeo = mergeParts([
+      taperedTube(
+        [
+          [0, -0.185, -0.006],
+          [0.002, -0.02, 0.006],
+          [0.005, 0.172, -0.004],
+        ],
+        0.0075,
+        0.0022,
+        0xf7f0e2,
+        8,
+        6
+      ),
+      transformGeo(
+        extrudeShape(outerVane, 0.008, 0.003, PALETTE.sparrowCinnamon, 7, { topLift: 0.08 }),
+        { rot: [0.05, 0.08, 0], pos: [-0.012, 0.01, 0.002] }
+      ),
+      transformGeo(
+        extrudeShape(innerVane, 0.008, 0.003, PALETTE.sparrowWingBar, 7, { topLift: 0.09 }),
+        { rot: [0.05, -0.08, 0], pos: [0.018, 0.008, 0.002] }
+      ),
+    ]);
+    this.featherGeo.computeBoundingSphere();
+
+    // Sculpted 3D swept crescent wisp for active wing-flutter & helicopter rotor strokes (never spawned during glide)
+    this.wingFlutterArcGeo = mergeParts([
+      taperedTube(
+        [
+          [-0.28, -0.08, -0.06],
+          [-0.14, 0.01, 0.04],
+          [0.0, 0.05, 0.08],
+        ],
+        0.004,
+        0.021,
+        0xfcf7eb,
+        8,
+        6
+      ),
+      taperedTube(
+        [
+          [0.0, 0.05, 0.08],
+          [0.14, 0.01, 0.04],
+          [0.28, -0.08, -0.06],
+        ],
+        0.021,
+        0.004,
+        0xfcf7eb,
+        8,
+        6
+      ),
+    ]);
+    this.wingFlutterArcGeo.computeBoundingSphere();
 
     this.starGeo = new THREE.OctahedronGeometry(0.15, 0);
     this.starGeo.deleteAttribute('uv');
@@ -210,6 +269,7 @@ export class WorldFX {
       vertexColors: false,
     });
     this.featherMat = createPastelMaterial({ vertexColors: true, side: THREE.DoubleSide });
+    this.wingFlutterArcMat = createUnlitPastelFXMaterial(0xfcf7eb, 0.46, true);
     this.splatMat = createPastelMaterial({ vertexColors: true });
     this.cloudMat = createPastelMaterial({
       vertexColors: true,
@@ -237,12 +297,17 @@ export class WorldFX {
       });
     }
 
-    // Instanced particle pools (6 draw calls max instead of 140 separate scene-graph meshes)
+    // Instanced particle pools (single draw call per pool)
     this.dustPuffPool = this.createInstancedPool(this.puffGeo, this.puffMatDust, 48);
     this.goldPuffPool = this.createInstancedPool(this.puffGeo, this.puffMatGold, 36);
     this.crumbCrustPool = this.createInstancedPool(this.starGeo, this.crumbCrustMat, 24);
     this.crumbSoftPool = this.createInstancedPool(this.starGeo, this.crumbSoftMat, 24);
-    this.featherPool = this.createInstancedPool(this.featherGeo, this.featherMat, 32);
+    this.featherPool = this.createInstancedPool(this.featherGeo, this.featherMat, 40);
+    this.wingFlutterArcPool = this.createInstancedPool(
+      this.wingFlutterArcGeo,
+      this.wingFlutterArcMat,
+      64
+    );
     const waterDropMat = createPastelMaterial({
       color: PALETTE.waterFoam,
       vertexColors: false,
@@ -277,26 +342,6 @@ export class WorldFX {
     const warmStar = new THREE.Mesh(this.starGeo, this.puffMatGold);
     warmStar.visible = false;
     this.group.add(warmOrbitRing, warmStar);
-
-    // Instanced wingtip trails (1 InstancedMesh for 96 sleek aerodynamic slipstream ribbons)
-    const trailGeo = new THREE.BoxGeometry(0.055, 0.02, 0.64);
-    trailGeo.deleteAttribute('uv');
-    const trailMat = createUnlitPastelFXMaterial(PALETTE.porcelainWhite, 0.44, false);
-    this.wingTrailInst = new THREE.InstancedMesh(trailGeo, trailMat, WING_TRAIL_POOL_SIZE);
-    this.wingTrailInst.frustumCulled = false;
-    this.wingTrailInst.castShadow = false;
-    this.wingTrailInst.receiveShadow = false;
-    for (let i = 0; i < WING_TRAIL_POOL_SIZE; i++) {
-      this.wingTrailInst.setMatrixAt(i, _zeroMat4);
-      this.wingTrailSlots.push({
-        pos: new THREE.Vector3(),
-        quat: new THREE.Quaternion(),
-        age: 99,
-        active: false,
-      });
-    }
-    this.wingTrailInst.instanceMatrix.needsUpdate = true;
-    this.group.add(this.wingTrailInst);
 
     // Persistent 64-slot gouache splat ring buffer (supports parenting to moving hats/heads/vehicles)
     for (let i = 0; i < SPLAT_RING_BUFFER_SIZE; i++) {
@@ -768,6 +813,97 @@ export class WorldFX {
   }
 
   /**
+   * Spawns sculpted 3D crescent airflow wisps & occasional down-feather flecks during active
+   * wingbeats, hop-flutters, and high-speed helicopter flutter-down (never during passive glide).
+   */
+  public spawnWingFlutterArc(
+    wingTipPos: THREE.Vector3,
+    birdQuat: THREE.Quaternion,
+    side: -1 | 1,
+    isHelicopter: boolean,
+    intensity = 1.0
+  ): void {
+    const slot = this.acquirePoolSlot(this.wingFlutterArcPool);
+    _arcOffsetScratch
+      .set(-side * 0.08, isHelicopter ? 0.04 : 0.0, isHelicopter ? 0.0 : -0.05)
+      .applyQuaternion(birdQuat);
+    slot.pos.copy(wingTipPos).add(_arcOffsetScratch);
+
+    if (isHelicopter) {
+      // Horizontal rotor-plane sweep arc around each wingtip during straight-down helicopter flutter
+      const jitterYaw = (Math.random() - 0.5) * 0.55;
+      _eulerScratch.set(0.18, side * 0.45 + jitterYaw, side * 0.22);
+      _arcLocalQuat.setFromEuler(_eulerScratch);
+      _quatScratch.copy(birdQuat).multiply(_arcLocalQuat);
+      slot.rot.setFromQuaternion(_quatScratch);
+
+      const outPush = 1.1 + Math.random() * 0.9;
+      _arcOffsetScratch.set(side * outPush, -5.2 - intensity * 3.8, (Math.random() - 0.5) * 1.4).applyQuaternion(birdQuat);
+      slot.vel.copy(_arcOffsetScratch);
+      slot.age = 0;
+      slot.maxAge = 0.115 + Math.random() * 0.035;
+      slot.baseScale = 0.92 + intensity * 0.34;
+      slot.gravity = 0.0;
+      slot.spin = 0;
+    } else {
+      // Vertical figure-8 downstroke crescent arc hugging the outer primary remiges during active flapping
+      _eulerScratch.set(0.42, side * 1.35, -side * 1.18);
+      _arcLocalQuat.setFromEuler(_eulerScratch);
+      _quatScratch.copy(birdQuat).multiply(_arcLocalQuat);
+      slot.rot.setFromQuaternion(_quatScratch);
+
+      _arcOffsetScratch
+        .set(side * 0.65, -2.1 * intensity, -2.6 * intensity)
+        .applyQuaternion(birdQuat);
+      slot.vel.copy(_arcOffsetScratch);
+      slot.age = 0;
+      slot.maxAge = 0.13 + Math.random() * 0.03;
+      slot.baseScale = 0.78 + intensity * 0.32;
+      slot.gravity = 0.0;
+      slot.spin = 0;
+    }
+  }
+
+  /**
+   * Subtle ground rotor-wash ring & outward dust flecks when helicopter-fluttering near a surface.
+   */
+  public spawnHelicopterDownwash(groundPos: THREE.Vector3, intensity = 1.0): void {
+    const ring = this.acquireRingSlot();
+    const op = Math.min(0.46, 0.24 + intensity * 0.18);
+    ring.mesh.geometry = this.flatRingGeo;
+    ring.mesh.position.set(groundPos.x, groundPos.y + 0.04, groundPos.z);
+    ring.mesh.rotation.set(0, 0, 0);
+    ring.mesh.scale.setScalar(0.24);
+    ring.mat.color.setHex(PALETTE.wallCreamTrim);
+    ring.mat.opacity = op;
+    ring.age = 0;
+    ring.maxAge = 0.38;
+    ring.startScale = 0.24;
+    ring.endScale = 1.45 + intensity * 0.75;
+    ring.baseOpacity = op;
+    ring.active = true;
+    ring.mesh.visible = true;
+
+    for (let i = 0; i < 2; i++) {
+      const dust = this.acquirePoolSlot(this.dustPuffPool);
+      const a = Math.random() * Math.PI * 2;
+      dust.pos.set(
+        groundPos.x + Math.cos(a) * 0.22,
+        groundPos.y + 0.06,
+        groundPos.z + Math.sin(a) * 0.22
+      );
+      dust.rot.set(0, 0, 0);
+      const outSpd = 2.2 + intensity * 1.8;
+      dust.vel.set(Math.cos(a) * outSpd, 0.45 + Math.random() * 0.4, Math.sin(a) * outSpd);
+      dust.baseScale = 0.38 + intensity * 0.18;
+      dust.age = 0;
+      dust.maxAge = 0.28;
+      dust.gravity = 3.5;
+      dust.spin = 0;
+    }
+  }
+
+  /**
    * Spawns tumbling 3D glazed ceramic / terracotta / glass shards + a dry dust burst.
    */
   public spawnShatterDebris(origin: THREE.Vector3, shardHex: number): void {
@@ -853,30 +989,6 @@ export class WorldFX {
     this.activePlayerDizzyHalo = null;
   }
 
-  public spawnWingtipCrumb(
-    leftTip: THREE.Vector3,
-    rightTip: THREE.Vector3,
-    quat: THREE.Quaternion
-  ): void {
-    for (let side = 0; side < 2; side++) {
-      const tip = side === 0 ? leftTip : rightTip;
-      const idx = this.wingTrailCursor;
-      this.wingTrailCursor = (this.wingTrailCursor + 1) % this.wingTrailSlots.length;
-      const slot = this.wingTrailSlots[idx];
-      slot.pos.copy(tip);
-      slot.quat.copy(quat);
-      slot.age = 0;
-      if (!slot.active) {
-        slot.active = true;
-        this.wingTrailActiveCount++;
-      }
-      _scaleScratch.set(1, 1, 1);
-      _mat4Scratch.compose(slot.pos, slot.quat, _scaleScratch);
-      this.wingTrailInst.setMatrixAt(idx, _mat4Scratch);
-    }
-    this.wingTrailInst.instanceMatrix.needsUpdate = true;
-  }
-
   private updateInstancedPool(pool: InstancedParticlePool, dt: number): void {
     if (pool.activeCount === 0 && !pool.dirty) return;
     let remaining = 0;
@@ -955,6 +1067,7 @@ export class WorldFX {
     this.updateInstancedPool(this.crumbCrustPool, dt);
     this.updateInstancedPool(this.crumbSoftPool, dt);
     this.updateInstancedPool(this.featherPool, dt);
+    this.updateInstancedPool(this.wingFlutterArcPool, dt);
     this.updateInstancedPool(this.petalBurstPool, dt);
     this.updateInstancedPool(this.waterDropPool, dt);
 
@@ -1002,30 +1115,7 @@ export class WorldFX {
       }
     }
 
-    // 6. Instanced wingtip trails (early-out when no trails active)
-    if (this.wingTrailActiveCount > 0) {
-      let activeLeft = 0;
-      for (let i = 0; i < this.wingTrailSlots.length; i++) {
-        const seg = this.wingTrailSlots[i];
-        if (!seg.active) continue;
-        seg.age += dt;
-        const t = seg.age / 0.34;
-        if (t >= 1) {
-          seg.active = false;
-          this.wingTrailInst.setMatrixAt(i, _zeroMat4);
-        } else {
-          activeLeft++;
-          const taper = Math.pow(1 - t, 1.35);
-          _scaleScratch.set(taper, taper, 1.0 - t * 0.25);
-          _mat4Scratch.compose(seg.pos, seg.quat, _scaleScratch);
-          this.wingTrailInst.setMatrixAt(i, _mat4Scratch);
-        }
-      }
-      this.wingTrailActiveCount = activeLeft;
-      this.wingTrailInst.instanceMatrix.needsUpdate = true;
-    }
-
-    // 7. Instanced sakura petals during Golden Bloom
+    // 6. Instanced sakura petals during Golden Bloom
     if (this.petalsActive) {
       _scaleScratch.set(1, 1, 1);
       for (let i = 0; i < this.petals.length; i++) {

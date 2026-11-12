@@ -737,11 +737,21 @@ export class BirdCamera {
 
     const posFollowXZ = 1 - Math.exp(-dt * (isFlying ? 11.5 : 13.5));
     const cageGroundSoftY = !isFlying ? this.inCageBlend : 0;
+    const fastDescentBoost = isFlying && (params.verticalVel ?? 0) < -8.0 ? 16.5 : 11.5;
     const posFollowY =
-      1 - Math.exp(-dt * (isFlying ? 11.5 : THREE.MathUtils.lerp(13.0, 6.8, cageGroundSoftY)));
+      1 -
+      Math.exp(
+        -dt * (isFlying ? fastDescentBoost : THREE.MathUtils.lerp(13.0, 6.8, cageGroundSoftY))
+      );
     const lookFollowXZ = 1 - Math.exp(-dt * 16.0);
     const lookFollowY =
-      1 - Math.exp(-dt * THREE.MathUtils.lerp(16.0, 8.2, cageGroundSoftY));
+      1 -
+      Math.exp(
+        -dt *
+          (isFlying && (params.verticalVel ?? 0) < -8.0
+            ? 20.0
+            : THREE.MathUtils.lerp(16.0, 8.2, cageGroundSoftY))
+      );
 
     this.currentPos.x += (_desiredPos.x - this.currentPos.x) * posFollowXZ;
     this.currentPos.y += (_desiredPos.y - this.currentPos.y) * posFollowY;

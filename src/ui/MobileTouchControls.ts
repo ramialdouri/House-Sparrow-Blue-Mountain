@@ -8,6 +8,12 @@ export interface MobileStickState {
   magnitude: number;
   /** True while the user is actively long-pressing to fly. */
   longPress: boolean;
+  /** Live pointer/touch screen coordinates in CSS pixels. */
+  clientX: number;
+  clientY: number;
+  /** Touch-down origin screen coordinates in CSS pixels. */
+  originX: number;
+  originY: number;
 }
 
 export function detectInitialMobileDevice(): boolean {
@@ -76,9 +82,13 @@ export class MobileTouchControls {
     y: 0,
     magnitude: 0,
     longPress: false,
+    clientX: 0,
+    clientY: 0,
+    originX: 0,
+    originY: 0,
   };
 
-  public onTapJump?: () => void;
+  public onTapJump?: (clientX: number, clientY: number) => void;
   public onFlyHoldPrime?: (primed: boolean) => void;
   public onLongPressStart?: () => void;
   public onLongPressEnd?: () => void;
@@ -249,6 +259,10 @@ export class MobileTouchControls {
       this.originY += Math.sign(rawDy) * pullY;
     }
 
+    this.stick.clientX = this.curX;
+    this.stick.clientY = this.curY;
+    this.stick.originX = this.originX;
+    this.stick.originY = this.originY;
     this.updateStickFromDelta(this.curX - this.originX, this.curY - this.originY);
     this.syncJoystickVisual();
   }
@@ -286,6 +300,10 @@ export class MobileTouchControls {
             this.stick.x = 0;
             this.stick.y = 0;
             this.stick.magnitude = 0;
+            this.stick.clientX = t.clientX;
+            this.stick.clientY = t.clientY;
+            this.stick.originX = t.clientX;
+            this.stick.originY = t.clientY;
             this.startLongPressTimer();
             this.syncJoystickVisual();
           } else if (this.secondaryId === null && t.identifier !== this.primaryId) {
@@ -352,10 +370,10 @@ export class MobileTouchControls {
               this.chordFired = true;
               const consumedDrop = this.onTwoFingerTap?.() ?? false;
               if (!consumedDrop) {
-                this.onTapJump?.();
+                this.onTapJump?.(t.clientX, t.clientY);
               }
             } else {
-              this.onTapJump?.();
+              this.onTapJump?.(t.clientX, t.clientY);
             }
           }
           this.secondaryId = null;
@@ -380,10 +398,10 @@ export class MobileTouchControls {
                 this.chordFired = true;
                 const consumedDrop = this.onTwoFingerTap?.() ?? false;
                 if (!consumedDrop) {
-                  this.onTapJump?.();
+                  this.onTapJump?.(t.clientX, t.clientY);
                 }
               } else {
-                this.onTapJump?.();
+                this.onTapJump?.(t.clientX, t.clientY);
               }
             }
           }
@@ -424,6 +442,10 @@ export class MobileTouchControls {
       this.stick.x = 0;
       this.stick.y = 0;
       this.stick.magnitude = 0;
+      this.stick.clientX = e.clientX;
+      this.stick.clientY = e.clientY;
+      this.stick.originX = e.clientX;
+      this.stick.originY = e.clientY;
       this.startLongPressTimer();
       this.syncJoystickVisual();
     });
@@ -448,7 +470,7 @@ export class MobileTouchControls {
           dur <= MobileTouchControls.TAP_MAX_MS &&
           this.primaryPeakDist <= MobileTouchControls.TAP_MAX_MOVE_PX
         ) {
-          this.onTapJump?.();
+          this.onTapJump?.(e.clientX, e.clientY);
         }
       }
       this.primaryId = null;
@@ -499,11 +521,14 @@ export class MobileTouchControls {
     }
     this.joystickRoot.classList.add('is-active');
 
+    const isHelicopterDown =
+      (this.stick.longPress || this.flyHoldPrimed) && this.stick.y < -0.16;
+
     if (this.stick.longPress || this.flyHoldPrimed) {
       this.joystickRoot.classList.add('is-flying');
-      if (this.stick.y < -0.22) {
+      if (isHelicopterDown) {
         this.joystickRoot.classList.add('is-diving');
-        this.joystickBadge.textContent = 'DIVE ↘';
+        this.joystickBadge.textContent = 'FLUTTER ↓';
       } else {
         this.joystickRoot.classList.remove('is-diving');
         const upDrag = Math.max(0, Math.min(1, this.stick.y));
@@ -520,7 +545,7 @@ export class MobileTouchControls {
     const rawDy = this.curY - this.originY;
     const dist = Math.hypot(rawDx, rawDy);
     const clampedR = Math.min(MobileTouchControls.MAX_RADIUS, dist);
-    const nx = dist > 1e-4 ? (rawDx / dist) * clampedR : 0;
+    const nx = (dist > 1e-4 ? (rawDx / dist) * clampedR : 0) * (isHelicopterDown ? 0.14 : 1.0);
     const ny = dist > 1e-4 ? (rawDy / dist) * clampedR : 0;
     this.joystickNub.style.transform = `translate(calc(-50% + ${nx.toFixed(1)}px), calc(-50% + ${ny.toFixed(1)}px))`;
   }

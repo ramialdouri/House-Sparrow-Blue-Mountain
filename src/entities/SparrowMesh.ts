@@ -99,6 +99,7 @@ interface CachedSpeciesAssets {
   torsoMat: THREE.NodeMaterial;
   headMat: THREE.NodeMaterial;
   catchlightMat: THREE.NodeMaterial;
+  wingFlutterMat: THREE.MeshBasicNodeMaterial;
   bodyGeo: THREE.BufferGeometry;
   headGeo: THREE.BufferGeometry;
   headDetailsGeo: THREE.BufferGeometry;
@@ -107,8 +108,10 @@ interface CachedSpeciesAssets {
   lowerBeakGeo: THREE.BufferGeometry;
   wingLeftInnerGeo: THREE.BufferGeometry;
   wingLeftOuterGeo: THREE.BufferGeometry;
+  wingLeftFlutterGeo: THREE.BufferGeometry;
   wingRightInnerGeo: THREE.BufferGeometry;
   wingRightOuterGeo: THREE.BufferGeometry;
+  wingRightFlutterGeo: THREE.BufferGeometry;
   tailFeatherGeos: THREE.BufferGeometry[];
   thighGeo: THREE.BufferGeometry;
   tarsusGeo: THREE.BufferGeometry;
@@ -138,6 +141,7 @@ interface PigeonLegKinematics {
 const _speciesAssetCache = new Map<BirdSpecies, CachedSpeciesAssets>();
 let _sharedBirdMat: THREE.NodeMaterial | null = null;
 let _sharedCatchlightMat: THREE.NodeMaterial | null = null;
+let _sharedWingFlutterMat: THREE.MeshBasicNodeMaterial | null = null;
 let _sharedCrownGeo: THREE.BufferGeometry | null = null;
 let _sharedCrownMat: THREE.NodeMaterial | null = null;
 
@@ -414,14 +418,36 @@ function resolveSpeciesPalette(species: BirdSpecies): SpeciesPalette {
 function buildWingGeometriesForSide(
   side: -1 | 1,
   pal: SpeciesPalette
-): { innerGeo: THREE.BufferGeometry; outerGeo: THREE.BufferGeometry } {
+): {
+  innerGeo: THREE.BufferGeometry;
+  outerGeo: THREE.BufferGeometry;
+  flutterGeo: THREE.BufferGeometry;
+} {
   const bs = pal.bodyScale;
   const innerParts: THREE.BufferGeometry[] = [];
 
+  // 1. Sculpted propatagium leading-edge camber tube from shoulder to carpal wrist
+  innerParts.push(
+    taperedTube(
+      [
+        [side * 0.01, 0.012, 0.032],
+        [side * 0.12, 0.014, 0.036],
+        [side * 0.24, 0.008, 0.012],
+      ],
+      0.013,
+      0.0085,
+      pal.scapular,
+      8,
+      6,
+      { topLift: 0.08 }
+    )
+  );
+
+  // 2. Greater & median dorsal covert deck
   const covertShape = new THREE.Shape();
-  covertShape.moveTo(0, 0.032);
-  covertShape.bezierCurveTo(side * 0.13, 0.042, side * 0.23, 0.022, side * 0.265, -0.034);
-  covertShape.bezierCurveTo(side * 0.23, -0.125, side * 0.11, -0.152, 0, -0.125);
+  covertShape.moveTo(0, 0.034);
+  covertShape.bezierCurveTo(side * 0.13, 0.044, side * 0.23, 0.024, side * 0.268, -0.034);
+  covertShape.bezierCurveTo(side * 0.23, -0.128, side * 0.11, -0.156, 0, -0.128);
   covertShape.closePath();
 
   innerParts.push(
@@ -429,48 +455,72 @@ function buildWingGeometriesForSide(
       extrudeShape(covertShape, 0.012, 0.005, pal.mantle, 10, { topLift: 0.06 }),
       {
         rot: [Math.PI * 0.5, 0, 0],
-        pos: [0, 0.004, 0],
+        pos: [0, 0.005, 0],
       }
     )
   );
 
   const lesserShape = new THREE.Shape();
-  lesserShape.moveTo(0, 0.030);
-  lesserShape.bezierCurveTo(side * 0.09, 0.036, side * 0.17, 0.018, side * 0.18, -0.016);
-  lesserShape.bezierCurveTo(side * 0.14, -0.055, side * 0.07, -0.064, 0, -0.042);
+  lesserShape.moveTo(0, 0.032);
+  lesserShape.bezierCurveTo(side * 0.09, 0.038, side * 0.175, 0.020, side * 0.19, -0.016);
+  lesserShape.bezierCurveTo(side * 0.145, -0.058, side * 0.07, -0.068, 0, -0.044);
   lesserShape.closePath();
   innerParts.push(
     transformGeo(
       extrudeShape(lesserShape, 0.010, 0.004, pal.scapular, 8, { topLift: 0.07 }),
       {
         rot: [Math.PI * 0.5 - 0.04, 0, 0],
-        pos: [side * 0.018, 0.012, 0.008],
+        pos: [side * 0.018, 0.013, 0.008],
       }
     )
   );
 
-  const barFeatherShape = new THREE.Shape();
-  barFeatherShape.moveTo(0, 0.024);
-  barFeatherShape.bezierCurveTo(0.020, 0.012, 0.020, -0.028, 0, -0.042);
-  barFeatherShape.bezierCurveTo(-0.020, -0.028, -0.020, 0.012, 0, 0.024);
+  // 3. Overlapping Secondary Remiges along the trailing forearm/ulna (prevents elbow gap when spread)
+  const secondaryShape = new THREE.Shape();
+  secondaryShape.moveTo(0, 0.018);
+  secondaryShape.bezierCurveTo(side * 0.034, 0.010, side * 0.038, -0.095, side * 0.016, -0.165);
+  secondaryShape.bezierCurveTo(0, -0.178, -side * 0.016, -0.168, -side * 0.024, -0.095);
+  secondaryShape.bezierCurveTo(-side * 0.024, -0.02, -side * 0.010, 0.012, 0, 0.018);
+  secondaryShape.closePath();
 
-  for (let b = 0; b < 5; b++) {
+  for (let s = 0; s < 6; s++) {
+    const secCol = s % 2 === 0 ? pal.wingPrimary : pal.scapular;
+    const secLen = 0.92 + (s / 5) * 0.14;
+    innerParts.push(
+      transformGeo(
+        extrudeShape(secondaryShape, 0.0072, 0.0028, secCol, 7, { bottomAO: 0.08, topLift: 0.05 }),
+        {
+          scale: [1, secLen, 1],
+          rot: [Math.PI * 0.5 + 0.02, 0, side * (0.04 + s * 0.045)],
+          pos: [side * (0.032 + s * 0.036), -0.001 - s * 0.0008, -0.048 - s * 0.006],
+        }
+      )
+    );
+  }
+
+  // 4. Crisp creamy-white median covert wing-bar feathers (characteristic Passer domesticus mark)
+  const barFeatherShape = new THREE.Shape();
+  barFeatherShape.moveTo(0, 0.026);
+  barFeatherShape.bezierCurveTo(0.021, 0.013, 0.021, -0.030, 0, -0.046);
+  barFeatherShape.bezierCurveTo(-0.021, -0.030, -0.021, 0.013, 0, 0.026);
+
+  for (let b = 0; b < 6; b++) {
     innerParts.push(
       transformGeo(
         extrudeShape(barFeatherShape, 0.007, 0.003, pal.wingBar, 6, { bottomAO: 0.04, topLift: 0.09 }),
         {
           rot: [Math.PI * 0.5, 0, side * 0.18],
-          pos: [side * (0.044 + b * 0.038), 0.013, -0.024 - b * 0.008],
+          pos: [side * (0.038 + b * 0.034), 0.014, -0.022 - b * 0.007],
         }
       )
     );
-    if (pal.isPigeon && b < 4) {
+    if (pal.isPigeon && b < 5) {
       innerParts.push(
         transformGeo(
           extrudeShape(barFeatherShape, 0.007, 0.003, pal.wingBar, 6),
           {
             rot: [Math.PI * 0.5, 0, side * 0.18],
-            pos: [side * (0.064 + b * 0.040), 0.011, -0.076 - b * 0.008],
+            pos: [side * (0.058 + b * 0.036), 0.011, -0.076 - b * 0.007],
           }
         )
       );
@@ -479,27 +529,99 @@ function buildWingGeometriesForSide(
 
   const innerGeo = transformGeo(mergeParts(innerParts), { scale: [bs[0], 1, bs[2]] });
 
+  // 5. Outer Hand Wing: Alula (3 thumb-feathers at wrist) + 9 Slotted Airfoil Primary Remiges + Rachis Quills
+  const outerParts: THREE.BufferGeometry[] = [];
+
+  const alulaShape = new THREE.Shape();
+  alulaShape.moveTo(0, 0.018);
+  alulaShape.bezierCurveTo(side * 0.055, 0.022, side * 0.115, 0.010, side * 0.132, -0.008);
+  alulaShape.bezierCurveTo(side * 0.095, -0.030, side * 0.042, -0.032, 0, -0.018);
+  alulaShape.closePath();
+
+  for (let a = 0; a < 2; a++) {
+    outerParts.push(
+      transformGeo(
+        extrudeShape(
+          alulaShape,
+          0.0065,
+          0.0025,
+          a === 0 ? pal.wingPrimary : pal.wingBar,
+          6,
+          { topLift: 0.07 }
+        ),
+        {
+          scale: [1 - a * 0.22, 1 - a * 0.15, 1],
+          rot: [Math.PI * 0.5 - 0.08, side * 0.12, -side * 0.10],
+          pos: [side * (0.018 + a * 0.012), 0.014 - a * 0.002, 0.028 - a * 0.010],
+        }
+      )
+    );
+  }
+
   const primaryShape = new THREE.Shape();
-  primaryShape.moveTo(0, 0.038);
-  primaryShape.bezierCurveTo(side * 0.16, 0.045, side * 0.34, 0.020, side * 0.41, -0.020);
-  primaryShape.bezierCurveTo(side * 0.35, -0.078, side * 0.16, -0.092, 0, -0.062);
+  primaryShape.moveTo(0, 0.036);
+  primaryShape.bezierCurveTo(side * 0.16, 0.044, side * 0.35, 0.022, side * 0.435, -0.016);
+  primaryShape.bezierCurveTo(side * 0.38, -0.068, side * 0.17, -0.088, 0, -0.058);
   primaryShape.closePath();
 
-  const outerParts: THREE.BufferGeometry[] = [];
-  for (let f = 0; f < 7; f++) {
-    const col = f % 2 === 1 ? pal.scapular : pal.wingPrimary;
-    const scaleLen = (1.0 - f * 0.085) * (pal.isPigeon ? 1.18 : 1.0);
-    const feather = extrudeShape(primaryShape, 0.0075, 0.003, col, 8, { topLift: 0.05 });
+  for (let f = 0; f < 9; f++) {
+    const col = f % 3 === 1 ? pal.scapular : pal.wingPrimary;
+    const scaleLen = (1.03 - f * 0.068) * (pal.isPigeon ? 1.18 : 1.0);
+    const feather = extrudeShape(primaryShape, 0.0072, 0.0028, col, 8, { topLift: 0.05 });
+    const zRot = side * f * 0.068;
+    const px = side * (0.036 - f * 0.010);
+    const py = -f * 0.0022;
+    const pz = -0.004 - f * 0.027;
     transformGeo(feather, {
       scale: [scaleLen, scaleLen, 1],
-      rot: [Math.PI * 0.5, 0, side * f * 0.078],
-      pos: [side * (0.034 - f * 0.012), -f * 0.0025, -0.006 - f * 0.033],
+      rot: [Math.PI * 0.5, 0, zRot],
+      pos: [px, py, pz],
     });
     outerParts.push(feather);
+
+    // Subtle raised central rachis shaft along the outer primary blades
+    if (f < 5) {
+      const tipX = px + Math.cos(zRot) * side * 0.38 * scaleLen;
+      const tipZ = pz - Math.sin(Math.abs(zRot)) * 0.38 * scaleLen - 0.012;
+      outerParts.push(
+        taperedTube(
+          [
+            [px, py + 0.004, pz + 0.008],
+            [(px + tipX) * 0.52, py + 0.0045, (pz + tipZ) * 0.5 + 0.006],
+            [tipX, py + 0.002, tipZ],
+          ],
+          0.0038,
+          0.0014,
+          pal.wingBar,
+          6,
+          5
+        )
+      );
+    }
   }
 
   const outerGeo = mergeParts(outerParts);
-  return { innerGeo, outerGeo };
+
+  // 6. Translucent Feathered Motion-Flutter Fan (visible ONLY during rapid wingbeats & helicopter flutter, NEVER during glide)
+  const flutterParts: THREE.BufferGeometry[] = [];
+  const blurBladeShape = new THREE.Shape();
+  blurBladeShape.moveTo(0, 0.045);
+  blurBladeShape.bezierCurveTo(side * 0.18, 0.085, side * 0.36, 0.055, side * 0.44, -0.025);
+  blurBladeShape.bezierCurveTo(side * 0.35, -0.145, side * 0.16, -0.165, 0, -0.095);
+  blurBladeShape.closePath();
+
+  for (const tiltSign of [-1, 1] as const) {
+    flutterParts.push(
+      transformGeo(extrudeShape(blurBladeShape, 0.003, 0.001, pal.wingBar, 7), {
+        scale: [pal.isPigeon ? 1.12 : 0.98, 1.0, 1.0],
+        rot: [Math.PI * 0.5 + tiltSign * 0.26, 0, side * 0.12],
+        pos: [side * 0.02, tiltSign * 0.038, -0.035],
+      })
+    );
+  }
+  const flutterGeo = mergeParts(flutterParts);
+
+  return { innerGeo, outerGeo, flutterGeo };
 }
 
 function buildFootSoleGeo(legHex: number): THREE.BufferGeometry {
@@ -582,6 +704,9 @@ function buildSpeciesAssets(pal: SpeciesPalette): CachedSpeciesAssets {
   }
   if (!_sharedCatchlightMat) {
     _sharedCatchlightMat = createUnlitPastelFXMaterial(0xffffff, 0.95, false);
+  }
+  if (!_sharedWingFlutterMat) {
+    _sharedWingFlutterMat = createUnlitPastelFXMaterial(0xfbf5e8, 0.28, true);
   }
 
   const torsoMat = createBirdTorsoPlumageMaterial(pal);
@@ -843,6 +968,7 @@ function buildSpeciesAssets(pal: SpeciesPalette): CachedSpeciesAssets {
     torsoMat,
     headMat,
     catchlightMat: _sharedCatchlightMat,
+    wingFlutterMat: _sharedWingFlutterMat,
     bodyGeo,
     headGeo,
     headDetailsGeo,
@@ -851,8 +977,10 @@ function buildSpeciesAssets(pal: SpeciesPalette): CachedSpeciesAssets {
     lowerBeakGeo,
     wingLeftInnerGeo: leftWings.innerGeo,
     wingLeftOuterGeo: leftWings.outerGeo,
+    wingLeftFlutterGeo: leftWings.flutterGeo,
     wingRightInnerGeo: rightWings.innerGeo,
     wingRightOuterGeo: rightWings.outerGeo,
+    wingRightFlutterGeo: rightWings.flutterGeo,
     tailFeatherGeos,
     thighGeo,
     tarsusGeo,
@@ -917,6 +1045,8 @@ export class SparrowMesh {
 
   private readonly palette: SpeciesPalette;
   private readonly bodyMesh: THREE.Mesh;
+  private readonly wingLeftFlutterMesh: THREE.Mesh;
+  private readonly wingRightFlutterMesh: THREE.Mesh;
   private mat: THREE.NodeMaterial;
   private crownEquipped = false;
   private wingFlapPhase = 0;
@@ -981,14 +1111,23 @@ export class SparrowMesh {
       this.headPivot.add(this.crownGroup);
     }
 
-    // 3. Wings
+    // 3. Wings + Translucent Motion-Flutter Fans
+    this.wingLeftFlutterMesh = new THREE.Mesh(assets.wingLeftFlutterGeo, assets.wingFlutterMat);
+    this.wingLeftFlutterMesh.visible = false;
+    this.wingLeftFlutterMesh.castShadow = false;
+
+    this.wingRightFlutterMesh = new THREE.Mesh(assets.wingRightFlutterGeo, assets.wingFlutterMat);
+    this.wingRightFlutterMesh.visible = false;
+    this.wingRightFlutterMesh.castShadow = false;
+
     this.attachWing(
       -1,
       this.wingLeftInner,
       this.wingLeftOuter,
       this.wingTipLeft,
       assets.wingLeftInnerGeo,
-      assets.wingLeftOuterGeo
+      assets.wingLeftOuterGeo,
+      this.wingLeftFlutterMesh
     );
     this.attachWing(
       1,
@@ -996,7 +1135,8 @@ export class SparrowMesh {
       this.wingRightOuter,
       this.wingTipRight,
       assets.wingRightInnerGeo,
-      assets.wingRightOuterGeo
+      assets.wingRightOuterGeo,
+      this.wingRightFlutterMesh
     );
 
     // 4. Tail
@@ -1048,7 +1188,8 @@ export class SparrowMesh {
     outerGroup: THREE.Group,
     tipAnchor: THREE.Object3D,
     innerGeo: THREE.BufferGeometry,
-    outerGeo: THREE.BufferGeometry
+    outerGeo: THREE.BufferGeometry,
+    flutterMesh: THREE.Mesh
   ): void {
     const pal = this.palette;
     const bs = pal.bodyScale;
@@ -1066,6 +1207,7 @@ export class SparrowMesh {
     const outerMesh = new THREE.Mesh(outerGeo, this.mat);
     outerMesh.castShadow = true;
     outerGroup.add(outerMesh);
+    outerGroup.add(flutterMesh);
 
     tipAnchor.position.set(side * 0.40 * (pal.isPigeon ? 1.18 : 1.0), 0, -0.05);
     outerGroup.add(tipAnchor);
@@ -1367,6 +1509,8 @@ export class SparrowMesh {
 
     // --- Special 3-Stage Dizzy Knockout Pose Machine ---
     if (dizzyState !== 'none') {
+      this.wingLeftFlutterMesh.visible = dizzyState === 'falling' || dizzyState === 'shaking';
+      this.wingRightFlutterMesh.visible = dizzyState === 'falling' || dizzyState === 'shaking';
       this.bodyMesh.scale.set(1, 1, 1);
       this.bodyPivot.position.z = 0;
       this.headPivot.position.set(0, 0.17, 0.25);
@@ -1504,23 +1648,14 @@ export class SparrowMesh {
 
     const vy = p.verticalVel ?? 0;
     const airspeed = p.airspeed ?? 0;
-    const activeDive = p.isDiving ?? false;
-    // Stoop factor ONLY engages during intentional dives or steep high-speed plunges — never during -10° paraglider glides
-    const stoop =
-      p.mode === 'flying' && !p.isBraking && (activeDive || (vy < -8.5 && p.pitchAngle > 0.38))
-        ? Math.max(
-            0,
-            Math.min(
-              1,
-              activeDive
-                ? Math.max(0.45, Math.min(1, (-vy - 1.5) / 14.0 + Math.max(0, p.pitchAngle) * 0.65))
-                : (-vy - 8.5) / 10.0
-            )
-          )
-        : 0;
+    const flutterDown = p.mode === 'flying' && !p.isBraking && (p.isDiving ?? false);
 
+    // Crisp passerine saccadic head-cock fixations when perched/grounded (replaces floaty sine wave)
     const idleTilt =
-      p.mode !== 'flying' ? Math.sin(p.elapsed * 2.4) * 0.06 + Math.sin(p.elapsed * 6.1) * 0.02 : 0;
+      p.mode !== 'flying'
+        ? Math.tanh(Math.sin(p.elapsed * 2.15) * 5.5) * 0.048 +
+          Math.tanh(Math.sin(p.elapsed * 3.65 + 1.2) * 6.0) * 0.022
+        : 0;
     const bonkYawShake = bonk > 0 ? Math.sin(bonk * Math.PI * 6.0) * 0.42 * bonk : 0;
     const bonkRollShake = bonk > 0 ? Math.cos(bonk * Math.PI * 7.0) * 0.48 * bonk : 0;
 
@@ -1531,17 +1666,19 @@ export class SparrowMesh {
     const baseHeadZ = this.palette.isPigeon ? 0.224 : 0.184 * this.palette.bodyScale[2];
     const baseHeadY = this.palette.isPigeon ? 0.295 : 0.208 * this.palette.bodyScale[1];
     this.headPivot.position.x = 0;
-    const aeroNeckReach =
-      p.mode === 'flying' ? (stoop > 0.05 ? 0.032 * stoop : 0.014) : 0;
+    const aeroNeckReach = p.mode === 'flying' ? (flutterDown ? 0.022 : 0.014) : 0;
     this.headPivot.position.z =
       baseHeadZ + pigeonBobZ + aeroNeckReach + peckStrike * 0.092 + eatDip * 0.105;
     this.headPivot.position.y =
-      baseHeadY - (p.mode === 'flying' ? 0.012 : 0) - peckStrike * 0.032 - eatDip * 0.072;
+      baseHeadY - (p.mode === 'flying' ? (flutterDown ? 0.004 : 0.012) : 0) - peckStrike * 0.032 - eatDip * 0.072;
 
-    // Avian horizon-stabilized gaze: counter-rotates against body climb/glide pitch so the bird looks ahead along its flight path
+    // Vestibulo-Ocular Reflex (VOR) & visual ground tracking:
+    // Stabilizes gaze toward horizon during climb/glide, and pitches gaze downward to inspect the landing zone during helicopter flutter-down
     const flightHeadStabilize =
       p.mode === 'flying'
-        ? Math.max(-0.42, Math.min(0.48, -this.bodyPivot.rotation.x * 0.56))
+        ? flutterDown
+          ? -this.bodyPivot.rotation.x * 0.85 + 0.24
+          : Math.max(-0.42, Math.min(0.48, -this.bodyPivot.rotation.x * 0.58))
         : 0;
     const targetHeadPitch =
       p.headLookLocal.y -
@@ -1549,16 +1686,18 @@ export class SparrowMesh {
       flightHeadStabilize +
       peckStrike * 0.32 +
       eatDip * 0.58;
-    const flightBankLookYaw = p.mode === 'flying' ? -p.bankAngle * 0.24 : 0;
+    const flightBankLookYaw = p.mode === 'flying' ? -p.bankAngle * 0.28 : 0;
 
+    // Fast brainstem VOR head tracking in flight (dt * 24)
+    const vorRate = p.mode === 'flying' ? 24 : 18;
     this.headPivot.rotation.y +=
       (p.headLookLocal.x + flightBankLookYaw + bonkYawShake - this.headPivot.rotation.y) *
-      Math.min(1, dt * 16);
+      Math.min(1, dt * vorRate);
     this.headPivot.rotation.x +=
       (targetHeadPitch - this.headPivot.rotation.x) *
-      Math.min(1, dt * (peck > 0.01 || eat > 0.01 ? 30 : 18));
+      Math.min(1, dt * (peck > 0.01 || eat > 0.01 ? 30 : vorRate));
     this.headPivot.rotation.z =
-      idleTilt - p.bankAngle * (p.mode === 'flying' ? 0.34 : 0.22) + bonkRollShake + (p.introHeadRoll ?? 0);
+      idleTilt - p.bankAngle * (p.mode === 'flying' ? 0.42 : 0.22) + bonkRollShake + (p.introHeadRoll ?? 0);
 
     // Keep bodyPivot scale strictly (1, 1, 1) so child leg/wing bones never stretch; puff torso mesh only
     this.bodyPivot.scale.set(1, 1, 1);
@@ -1570,28 +1709,34 @@ export class SparrowMesh {
     }
 
     if (p.mode === 'flying') {
-      const targetBankRoll = -p.bankAngle * 0.76;
+      // Lock roll completely level (0) during straight-down helicopter flutter so the sparrow never tilts/rotates
+      const targetBankRoll = flutterDown ? 0 : -p.bankAngle * 0.78;
       this.bodyPivot.rotation.z +=
-        (targetBankRoll - this.bodyPivot.rotation.z) * Math.min(1, dt * 13);
+        (targetBankRoll - this.bodyPivot.rotation.z) * Math.min(1, dt * (flutterDown ? 20 : 15));
       const targetPitch =
         bonk > 0.1
           ? -0.38 * bonk
           : p.isBraking
             ? -0.50
-            : p.pitchAngle + stoop * 0.10 + peckStrike * 0.24;
-      this.bodyPivot.rotation.x += (targetPitch - this.bodyPivot.rotation.x) * Math.min(1, dt * 15);
+            : flutterDown
+              ? p.pitchAngle
+              : p.pitchAngle + peckStrike * 0.24;
+      this.bodyPivot.rotation.x += (targetPitch - this.bodyPivot.rotation.x) * Math.min(1, dt * 16);
       this.bodyPivot.position.z = peckStrike * 0.085;
 
       const tuck = bonk > 0.05 ? 0 : (p.wingTuck ?? 0);
       const climbBoost = Math.max(0, Math.min(1, (-p.pitchAngle - 0.35) / 0.68));
       let bodyStrokeLiftY = 0;
 
-      if (tuck > 0.55 && !p.isBraking && stoop < 0.15 && p.flapTimer <= 0) {
+      if (tuck > 0.55 && !p.isBraking && !flutterDown && p.flapTimer <= 0) {
+        // Passer domesticus intermittent flap-bounding ballistic phase (used by NPC songbirds)
         this.wasFlapping = false;
+        this.wingLeftFlutterMesh.visible = false;
+        this.wingRightFlutterMesh.visible = false;
         const boundRipple = Math.sin(p.elapsed * 22.0) * 0.03;
         this.applyWingJointPose(
           dt,
-          20,
+          22,
           -0.44,
           -1.38 + boundRipple,
           0.15,
@@ -1613,107 +1758,141 @@ export class SparrowMesh {
         let wingPitch = -0.08;
         let outerTwist = 0;
         let jointRate = 24;
+        let allowTurnStrokeAsym = false;
+        let showFlutterFan = false;
+        let flutterFanOsc = 0;
 
         if (bonk > 0.05) {
           this.wasFlapping = false;
+          showFlutterFan = true;
           stroke = 0.45 + Math.sin(bonk * Math.PI * 8.0) * 0.52;
           outerFlex = 0.28;
           wingPitch = -0.38;
           jointRate = 34;
+        } else if (flutterDown) {
+          // High-Speed Straight-Down Helicopter Flutter:
+          // Upright torso tilts the stroke plane horizontal while wings whip rapidly (~21.5 Hz)
+          // across a wide rotor arc with carpal wrist whip lag & feathered motion-blur fan!
+          if (!this.wasFlapping) {
+            this.wasFlapping = true;
+            this.wingFlapPhase = 0.16;
+          }
+          const hoverFreq = this.palette.isPigeon ? 14.8 : 21.6;
+          this.wingFlapPhase = (this.wingFlapPhase + dt * hoverFreq * Math.PI * 2.0) % (Math.PI * 2.0);
+          const sinP = Math.sin(this.wingFlapPhase);
+          const cosP = Math.cos(this.wingFlapPhase);
+          const wristPhase = this.wingFlapPhase - 0.62;
+          const sinWrist = Math.sin(wristPhase);
+          const cosWrist = Math.cos(wristPhase);
+
+          // Wide, fast, unmistakable horizontal-rotor stroke + carpal wrist snap
+          stroke = 0.36 + cosP * 0.92;
+          sweepBack = -0.58 * sinP - 0.06;
+          outerSweep = -0.34 * sinWrist;
+          outerFlex = 0.26 + sinWrist * 0.52;
+          wingPitch = sinP >= 0 ? -0.30 - sinP * 0.14 : -0.50 + sinP * 0.08;
+          outerTwist = -0.22 * cosWrist;
+          bodyStrokeLiftY = 0.022 * sinP;
+          jointRate = 56;
+          allowTurnStrokeAsym = false; // Strictly symmetric straight-down helicopter rotor
+          showFlutterFan = true;
+          flutterFanOsc = cosP * 0.24;
         } else if (p.flapTimer > 0) {
           // Stateful phase accumulator prevents phase-warping when climb angle changes 30° -> 60°
           if (!this.wasFlapping) {
             this.wasFlapping = true;
             this.wingFlapPhase = 0.24; // Start right at top of power downstroke for 0ms visual snap
           }
-          const flapFreq = this.palette.isPigeon ? 9.4 : 13.6 + climbBoost * 3.2;
+          const flapFreq = this.palette.isPigeon ? 9.6 : 14.6 + climbBoost * 3.6;
           this.wingFlapPhase = (this.wingFlapPhase + dt * flapFreq * Math.PI * 2.0) % (Math.PI * 2.0);
           const sinP = Math.sin(this.wingFlapPhase);
           const cosP = Math.cos(this.wingFlapPhase);
+          const sinWrist = Math.sin(this.wingFlapPhase - 0.54);
 
-          // Asymmetric figure-8 avian wingbeat:
-          // sinP < 0 is power downstroke (stroke goes positive->negative), wait:
-          // Note: stroke > 0 raises wings UP (+Y), stroke < 0 drives wings DOWN (-Y).
-          // When phase goes 0.24 -> pi, cosP goes +0.97 -> -1 (wings sweep from HIGH +1.02 DOWN to -0.82 = power downstroke!)
-          // Let's use cosP for vertical elevation so phase=0 starts at peak elevation and immediately drives DOWN!
-          const isDownstroke = sinP >= 0; // d(cosP)/dt = -sinP <= 0 -> moving DOWN!
-          const strokeUpAmp = 1.02 + climbBoost * 0.16;
-          const strokeDownAmp = 0.78 + climbBoost * 0.14;
+          const isDownstroke = sinP >= 0;
+          const strokeUpAmp = 1.12 + climbBoost * 0.16;
+          const strokeDownAmp = 0.86 + climbBoost * 0.14;
           stroke = cosP >= 0 ? cosP * strokeUpAmp : cosP * strokeDownAmp;
 
           if (isDownstroke) {
-            // Power downstroke: full span extension, forward reach, pronated thrust pitch (+X)
+            // Power downstroke: full span extension, forward reach, pronated thrust pitch (+X), wrist whip
             const power = sinP;
-            outerFlex = 0.14 + power * (0.28 + climbBoost * 0.12);
-            sweepBack = -0.18 * power - climbBoost * 0.08;
-            outerSweep = -0.08 * power;
-            wingPitch = 0.14 + power * 0.12 - climbBoost * 0.06;
-            outerTwist = 0.10 * power;
-            bodyStrokeLiftY = 0.020 * power;
+            outerFlex = 0.16 + Math.max(0, sinWrist) * (0.36 + climbBoost * 0.14);
+            sweepBack = -0.22 * power - climbBoost * 0.08;
+            outerSweep = -0.14 * Math.max(0, sinWrist);
+            wingPitch = 0.15 + power * 0.14 - climbBoost * 0.06;
+            outerTwist = 0.14 * power;
+            bodyStrokeLiftY = 0.022 * power;
           } else {
-            // Feathered recovery upstroke: carpal wrist flexes inward, primaries supinate (-X) & sweep slightly back
+            // Feathered recovery upstroke: carpal wrist flexes inward, primaries supinate (-X) & sweep back
             const up = -sinP;
-            outerFlex = -0.54 * up;
-            sweepBack = 0.18 * up;
-            outerSweep = 0.30 * up;
-            wingPitch = -0.24 * up - climbBoost * 0.10;
-            outerTwist = -0.18 * up;
-            bodyStrokeLiftY = -0.008 * up;
+            outerFlex = -0.58 * up;
+            sweepBack = 0.20 * up;
+            outerSweep = 0.34 * up;
+            wingPitch = -0.26 * up - climbBoost * 0.10;
+            outerTwist = -0.22 * up;
+            bodyStrokeLiftY = -0.010 * up;
           }
-          jointRate = 42;
+          jointRate = 48;
+          allowTurnStrokeAsym = true;
+          showFlutterFan = true;
+          flutterFanOsc = sinP * 0.16;
         } else if (p.isBraking) {
           this.wasFlapping = false;
-          const brakeWave = Math.sin(p.elapsed * 28.0);
-          stroke = 0.28 + brakeWave * 0.46;
-          outerFlex = 0.24 + Math.cos(p.elapsed * 28.0) * 0.14;
-          sweepBack = -0.22;
-          outerSweep = -0.10;
+          showFlutterFan = true;
+          const brakeWave = Math.sin(p.elapsed * 30.0);
+          stroke = 0.32 + brakeWave * 0.54;
+          outerFlex = 0.26 + Math.cos(p.elapsed * 30.0) * 0.18;
+          sweepBack = -0.24;
+          outerSweep = -0.12;
           wingPitch = -0.46; // Cup underside of wings forward against airflow
-          jointRate = 32;
-        } else if (stoop > 0.04) {
-          // Intentional high-speed falcon stoop / dive: sleek swept-back delta teardrop
-          this.wasFlapping = false;
-          const speedRatio = Math.min(1, airspeed / 24.0);
-          const aeroTremor =
-            Math.sin(p.elapsed * 31.0) * 0.022 * stoop * speedRatio +
-            Math.cos(p.elapsed * 47.0) * 0.012 * stoop * speedRatio;
-          stroke = 0.08 + stoop * 0.16 + aeroTremor;
-          outerFlex = -0.16 * stoop + aeroTremor * 0.8;
-          sweepBack = 0.32 + stoop * 0.58;
-          outerSweep = 0.18 + stoop * 0.34;
-          wingPitch = 0.06 * stoop;
-          jointRate = 22;
+          jointRate = 38;
+          allowTurnStrokeAsym = true;
+          flutterFanOsc = brakeWave * 0.18;
         } else {
           // Buoyant -10° Paraglider Soaring Glide:
-          // Wide, high-aspect cambered canopy with gentle dihedral & upturned slotted primary tips
+          // Wide, clean cambered canopy with aeroelastic primary-feather tip wind-tremor and ZERO glide lines/blur
           this.wasFlapping = false;
+          showFlutterFan = false;
           const speedLift = Math.max(0, Math.min(1, (airspeed - 7.5) / 9.0));
           const breathA = p.elapsed * 2.6;
-          const soarWave = Math.sin(breathA) * 0.024 + Math.sin(p.elapsed * 6.4) * 0.008 * speedLift;
+          const windTremor = Math.sin(p.elapsed * 21.0) * 0.016 * speedLift;
+          const soarWave = Math.sin(breathA) * 0.024 + windTremor;
           stroke = 0.16 + speedLift * 0.04 + soarWave;
-          outerFlex = 0.15 + speedLift * 0.05 + Math.sin(breathA - 0.7) * 0.022;
+          outerFlex = 0.16 + speedLift * 0.05 + Math.sin(breathA - 0.7) * 0.022 + windTremor * 0.8;
           sweepBack = -0.05 + speedLift * 0.04;
           outerSweep = 0.04;
           wingPitch = -0.09; // Subtle positive camber catching rising air
-          outerTwist = -0.04;
+          outerTwist = -0.04 + windTremor * 0.6;
           bodyStrokeLiftY = Math.sin(breathA) * 0.008;
-          jointRate = 20;
+          jointRate = 22;
         }
 
-        // Coordinated aerodynamic banking differential (aileron roll + subtle inner/outer sweep trim)
-        const aileronTrim = p.bankAngle * 0.15;
-        const bankSweepDiff = p.bankAngle * 0.08;
-        const bankFlexDiff = p.bankAngle * 0.06;
+        this.wingLeftFlutterMesh.visible = showFlutterFan;
+        this.wingRightFlutterMesh.visible = showFlutterFan;
+        if (showFlutterFan) {
+          this.wingLeftFlutterMesh.rotation.x = flutterFanOsc;
+          this.wingRightFlutterMesh.rotation.x = flutterFanOsc;
+        }
+
+        // Bilateral neuromuscular turn reflex (disabled during straight-down helicopter flutter)
+        const bankEff = flutterDown ? 0 : p.bankAngle;
+        const turnAsym = allowTurnStrokeAsym ? Math.max(-0.22, Math.min(0.22, bankEff * 0.18)) : 0;
+        const strokeL = stroke * (1.0 + turnAsym);
+        const strokeR = stroke * (1.0 - turnAsym);
+        const aileronTrim = bankEff * 0.15;
+        const bankSweepDiff = bankEff * 0.09;
+        const bankFlexDiff = bankEff * 0.06;
 
         this.applyWingJointPose(
           dt,
           jointRate,
           wingPitch,
           0.05 - sweepBack - bankSweepDiff,
-          -stroke - aileronTrim,
+          -strokeL - aileronTrim,
           wingPitch,
           -0.05 + sweepBack - bankSweepDiff,
-          stroke - aileronTrim,
+          strokeR - aileronTrim,
           outerTwist,
           -outerSweep,
           -outerFlex - bankFlexDiff,
@@ -1723,45 +1902,69 @@ export class SparrowMesh {
         );
       }
 
-      this.bodyPivot.position.y += (bodyStrokeLiftY - this.bodyPivot.position.y) * Math.min(1, dt * 22);
+      this.bodyPivot.position.y += (bodyStrokeLiftY - this.bodyPivot.position.y) * Math.min(1, dt * 24);
 
-      // Tail ruddervator: fans wide for climb & braking, sleek spear in dive, broad buoyant fan in -10° paraglider glide
+      // Tail ruddervator: splays wide into a symmetric drag parachute during straight-down helicopter flutter
+      const tailBankEff = flutterDown ? 0 : p.bankAngle;
       const fanSpread =
         bonk > 0.05
           ? 0.17
-          : p.isBraking
-            ? 0.155
-            : stoop > 0.08
-              ? 0.068 * (1.0 - stoop * 0.58) + Math.abs(p.bankAngle) * 0.025
-              : tuck > 0.55
-                ? 0.028
-                : 0.084 + climbBoost * 0.042 + Math.abs(p.bankAngle) * 0.045;
+          : p.isBraking || flutterDown
+            ? 0.165 + Math.abs(tailBankEff) * 0.025
+            : tuck > 0.55
+              ? 0.028
+              : 0.084 + climbBoost * 0.042 + Math.abs(tailBankEff) * 0.045;
       const tailFlutter =
-        p.flapTimer > 0
-          ? Math.sin(this.wingFlapPhase) * 0.045
-          : stoop > 0.1
-            ? Math.sin(p.elapsed * 30.0) * 0.022 * stoop
-            : Math.sin(p.elapsed * 2.6 - 0.5) * 0.015;
+        flutterDown
+          ? Math.sin(this.wingFlapPhase) * 0.055
+          : p.flapTimer > 0
+            ? Math.sin(this.wingFlapPhase) * 0.045
+            : Math.sin(p.elapsed * 2.6 - 0.5) * 0.014;
       const targetTailX =
         p.isBraking || bonk > 0.1
           ? -0.46
-          : stoop > 0.08
-            ? -0.02 - stoop * 0.08 + tailFlutter
+          : flutterDown
+            ? -0.38 + tailFlutter
             : -0.06 - p.pitchAngle * 0.18 + tailFlutter;
-      this.tailPivot.rotation.x += (targetTailX - this.tailPivot.rotation.x) * Math.min(1, dt * 18);
+      this.tailPivot.rotation.x += (targetTailX - this.tailPivot.rotation.x) * Math.min(1, dt * 20);
       this.tailPivot.rotation.y +=
-        (-p.bankAngle * 0.16 - this.tailPivot.rotation.y) * Math.min(1, dt * 14);
+        (-tailBankEff * 0.18 - this.tailPivot.rotation.y) * Math.min(1, dt * 16);
       this.tailPivot.rotation.z +=
-        (-p.bankAngle * 0.34 - this.tailPivot.rotation.z) * Math.min(1, dt * 16);
+        (-tailBankEff * 0.34 - this.tailPivot.rotation.z) * Math.min(1, dt * 18);
       for (let idx = 0; idx < this.tailFeathers.length; idx++) {
         this.tailFeathers[idx].rotation.y = (idx - 3.0) * fanSpread;
       }
 
       if (p.isBraking || bonk > 0.15) {
-        this.applyLegJointPose(this.leftLegRig, dt, 18, -0.42, 0.22, 0.10, -0.34, 0.22, -0.08);
-        this.applyLegJointPose(this.rightLegRig, dt, 18, -0.42, 0.22, 0.10, -0.34, 0.22, 0.08);
+        this.applyLegJointPose(this.leftLegRig, dt, 20, -0.42, 0.22, 0.10, -0.34, 0.22, -0.08);
+        this.applyLegJointPose(this.rightLegRig, dt, 20, -0.42, 0.22, 0.10, -0.34, 0.22, 0.08);
+      } else if (flutterDown) {
+        // Helicopter flutter-down: legs partially extend with open landing-ready talons to grasp perches/ground
+        const hoverToePulse = Math.sin(this.wingFlapPhase * 0.5) * 0.04;
+        this.applyLegJointPose(
+          this.leftLegRig,
+          dt,
+          18,
+          -0.46,
+          -0.12,
+          0.22,
+          -0.22 + hoverToePulse,
+          0.16,
+          -0.06
+        );
+        this.applyLegJointPose(
+          this.rightLegRig,
+          dt,
+          18,
+          -0.46,
+          -0.12,
+          0.22,
+          -0.22 - hoverToePulse,
+          0.16,
+          0.06
+        );
       } else {
-        // Streamlined tucked feet nestled cleanly into belly plumage during flight & glide
+        // Streamlined tucked feet nestled cleanly into belly plumage during climb & -10° paraglider glide
         this.applyLegJointPose(this.leftLegRig, dt, 18, -0.60, -1.10, 1.16, 0.94, -0.84, 0.04);
         this.applyLegJointPose(this.rightLegRig, dt, 18, -0.60, -1.10, 1.16, 0.94, -0.84, -0.04);
       }
@@ -1783,7 +1986,7 @@ export class SparrowMesh {
       // Prime phase accumulator at top of downstroke so transitioning to flying mode has 0ms seam
       this.wasFlapping = true;
       this.wingFlapPhase = 0.20;
-    } else {
+    } else if (!hopAirborne) {
       this.wasFlapping = false;
     }
 
@@ -2012,9 +2215,17 @@ export class SparrowMesh {
     }
 
     const hopArc = Math.sin(p.hopPhase * Math.PI);
-    // During an airborne hop, shoulders cock slightly outward in readiness for immediate flight
-    const readyCock = hopAirborne ? 0.26 * Math.max(0.35, hopArc) : 0;
-    const hopFlick = hopArc * 0.18 + readyCock + bonk * 0.52 + peckStrike * 0.28 + eatDip * 0.22;
+    // Spontaneous passerine wing-flicks when chirping, pecking, or alertly perched
+    const idleSpontaneousTwitch = !hopAirborne
+      ? Math.pow(Math.max(0, Math.sin(p.elapsed * 2.35 + 0.7)), 22) * 0.24 +
+        Math.max(0, p.chirpOpen) * 0.26
+      : 0;
+    const hopFlick =
+      hopArc * 0.22 +
+      idleSpontaneousTwitch +
+      bonk * 0.52 +
+      peckStrike * 0.28 +
+      eatDip * 0.22;
     const foldX = -0.48 + hopFlick * 0.35;
     const foldYL = -1.46 + hopFlick;
     const foldZL = 0.16 - hopFlick * 0.5;
@@ -2026,47 +2237,70 @@ export class SparrowMesh {
 
     if (flyPrime > 0.01) {
       // Zero-delay 2nd-press anticipation: immediately unfurl wings to top of takeoff downstroke!
+      this.wingLeftFlutterMesh.visible = true;
+      this.wingRightFlutterMesh.visible = true;
+      this.wingLeftFlutterMesh.rotation.x = 0.14;
+      this.wingRightFlutterMesh.rotation.x = 0.14;
       this.applyWingJointPose(
         dt,
         46,
         0.12,
         0.16,
-        -0.92,
+        -0.98,
         0.12,
         -0.16,
-        0.92,
-        0.06,
+        0.98,
+        0.08,
         0.04,
-        -0.24,
-        0.06,
+        -0.28,
+        0.08,
         -0.04,
-        0.24
+        0.28
       );
-    } else if (hopAirborne && p.flapTimer > 0.02) {
-      // Airborne flutter-hop (e.g., hopping off a perch or locked cage hop): crisp mini wingbeats
-      const miniStroke = 0.36 + Math.sin(p.elapsed * 28.0) * 0.42;
+    } else if (hopAirborne) {
+      // Airborne hop: crisp, rapid passerine wing-flutter on EVERY hop (with 0ms flight-ready posture)
+      if (!this.wasFlapping) {
+        this.wasFlapping = true;
+        this.wingFlapPhase = 0.18;
+      }
+      const hopFreq = this.palette.isPigeon ? 12.5 : 18.0;
+      this.wingFlapPhase = (this.wingFlapPhase + dt * hopFreq * Math.PI * 2.0) % (Math.PI * 2.0);
+      const sinH = Math.sin(this.wingFlapPhase);
+      const cosH = Math.cos(this.wingFlapPhase);
+      const boost = p.flapTimer > 0.02 ? 1.0 : 0.78;
+      const miniStroke = (0.38 + cosH * 0.54) * boost;
+      const miniSweep = -0.26 * sinH * boost;
+      const miniFlex = (0.20 + Math.sin(this.wingFlapPhase - 0.5) * 0.28) * boost;
+
+      this.wingLeftFlutterMesh.visible = true;
+      this.wingRightFlutterMesh.visible = true;
+      this.wingLeftFlutterMesh.rotation.x = sinH * 0.16;
+      this.wingRightFlutterMesh.rotation.x = sinH * 0.16;
+
       this.applyWingJointPose(
         dt,
-        34,
-        0.06,
-        -0.25,
+        40,
+        -0.12 - 0.14 * sinH,
+        -0.22 - miniSweep,
         -miniStroke,
-        0.06,
-        0.25,
+        -0.12 - 0.14 * sinH,
+        0.22 + miniSweep,
         miniStroke,
-        0,
+        -0.06 * cosH,
         -0.08,
-        -0.18,
-        0,
+        -miniFlex,
+        -0.06 * cosH,
         0.08,
-        0.18
+        miniFlex
       );
     } else if (flareW > 0.001) {
-      const flareStroke = 0.34 + Math.sin(p.elapsed * 30.0) * 0.36;
-      const flareOuter = 0.22;
+      this.wingLeftFlutterMesh.visible = flareW > 0.25;
+      this.wingRightFlutterMesh.visible = flareW > 0.25;
+      const flareStroke = 0.38 + Math.sin(p.elapsed * 32.0) * 0.44;
+      const flareOuter = 0.26;
       this.applyWingJointPose(
         dt,
-        30,
+        32,
         -0.42 * flareW + foldX * (1.0 - flareW),
         0.12 * flareW + foldYL * (1.0 - flareW),
         -flareStroke * flareW + foldZL * (1.0 - flareW),
@@ -2081,6 +2315,8 @@ export class SparrowMesh {
         flareOuter * flareW - 0.04 * (1.0 - flareW)
       );
     } else {
+      this.wingLeftFlutterMesh.visible = false;
+      this.wingRightFlutterMesh.visible = false;
       this.applyWingJointPose(
         dt,
         24,
